@@ -1,7 +1,7 @@
 # Mini-R1: 从零训练一个会推理的小模型
 
 **「预训练 → SFT → GRPO 强化学习」全流程从零实现** —— 对标 DeepSeek-R1 的推理模型训练路线，
-在 3×RTX 4090 上训练一个 ~0.4B 的数学推理模型。
+用**一张 RTX 4090** 训练一个 ~0.4B 的数学推理模型（全程单卡可复现）。
 
 ## ✨ 项目亮点
 
@@ -9,7 +9,7 @@
 |------|------|----------|
 | 模型 | 从零手写 Llama 风格 Transformer（RMSNorm / RoPE / SwiGLU / GQA / Tied Embeddings），仅依赖 PyTorch | 注意力机制、位置编码、GQA 显存分析 |
 | 分词器 | 从零训练 byte-level BPE（vocab 152K，与 Qwen2 同规模） | BPE 合并算法、subword 原理 |
-| 预训练 | ~10B tokens (FineWeb-Edu)，DDP 分布式 + bf16 混合精度 + 梯度检查点 + 余弦退火 | 分布式训练、缩放定律、训练稳定性 |
+| 预训练 | 5B tokens (FineWeb-Edu)，bf16 混合精度 + 梯度检查点 + **WSD 学习率调度** + 断点续训 | 训练稳定性、学习率调度、显存优化 |
 | SFT | ChatML 指令微调，仅对回复部分计算 loss（label masking） | 数据格式、loss 设计 |
 | **GRPO** | **从零实现 GRPO 算法**：组内相对优势、clip 概率比、k3 KL 估计，GSM8K 规则奖励（答案正确性 + 格式） | RL 数学推导、advantage、KL 正则 |
 | 评测 | pass@1 / maj@k 多数投票，SFT vs GRPO 对比消融 | 实验设计 |
@@ -26,11 +26,12 @@ FFN 4096 (SwiGLU) | vocab 152,064 | max_seq 4096 | RoPE θ=10,000 | 无偏置无
 ## 🔄 训练流程
 
 ```
-FineWeb-Edu (10B tok) ──BPE──> 二进制分片 ──预训练──> base 模型
-                                                        │ SFT (OpenHermes)
-                                                        ▼
-                                                   SFT 模型 ──GRPO──> RL 模型
-                                                  (π_ref 冻结)   (GSM8K, 规则奖励)
+FineWeb-Edu (10B tok 语料, 取 5B 训练)
+        │ BPE (vocab 152K)
+        ▼
+   二进制分片 ──预训练──> base 模型 ──SFT (OpenHermes)──> SFT 模型 ──GRPO──> RL 模型
+                                                                    (GSM8K, 规则奖励)
+                                                          π_ref = SFT 权重, 冻结
 ```
 
 ### GRPO 算法（从零实现, [train_grpo.py](src/train_grpo.py)）
@@ -40,11 +41,14 @@ FineWeb-Edu (10B tok) ──BPE──> 二进制分片 ──预训练──> ba
 ```
 Aᵢ = (rᵢ − mean(r)) / std(r)
 
-L = −E[ min(ρᵢ·Aᵢ, clip(ρᵢ, 1−ε, 1+ε)·Aᵢ) ] + β · KL(π_ref ‖ π_θ)
+L = −E[ min(ρᵢ·Aᵢ, clip(ρᵢ, 1−ε, 1+ε)·Aᵢ) ] + β · KL(π_θ ‖ π_ref)
 ρᵢ = π_θ(oᵢ|q) / π_θ_old(oᵢ|q)          # 逐 token 概率比
 
 KL 用 k3 无偏估计: exp(logπ_ref − logπ_θ) − (logπ_ref − logπ_θ) − 1
 ```
+
+> k3 的方向：样本 x ~ p 时 `(q/p) − log(q/p) − 1` 是 `KL(p‖q)` 的无偏估计。这里 p=π_θ、q=π_ref，
+> 估出来的是 **KL(π_θ‖π_ref)**（把当前策略拉回参考策略），别写成反的。
 
 奖励函数：规则化（无奖励模型）—— 数学答案对错（`\boxed{}` / 末位数字提取，与 gold 归一化比对）+ 格式奖励。
 
@@ -52,16 +56,21 @@ KL 用 k3 无偏估计: exp(logπ_ref − logπ_θ) − (logπ_ref − logπ_θ)
 
 ```
 src/
-  model.py            # 从零 Transformer + 采样
-  tokenizer_train.py  # BPE 分词器训练
-  data_pretrain.py    # 数据下载与分词分片
-  train_pretrain.py   # DDP 预训练
-  train_sft.py        # 指令微调
-  train_grpo.py       # GRPO 强化学习 (含奖励函数)
-  eval_gsm8k.py       # pass@1 / maj@k 评测
-  chat.py             # 交互式 demo
+  model.py             # 从零 Transformer (RMSNorm/RoPE/SwiGLU/GQA) + 采样 + 分块交叉熵
+  tokenizer_train.py   # BPE 分词器训练
+  data_pretrain.py     # 数据下载与分词分片
+  train_pretrain.py    # 预训练 (bf16 + 梯度检查点 + WSD + 断点续训)
+  train_sft.py         # 指令微调 (ChatML, 只对 assistant 段算 loss)
+  train_grpo.py        # GRPO 强化学习 (含规则奖励函数)
+  eval_gsm8k.py        # pass@1 / maj@k 评测
+  chat.py              # 交互式 demo
 scripts/
-  server_setup.sh     # 服务器环境一键搭建
+  server_setup.sh      # 环境一键搭建
+  run_pretrain.sh      # 选空闲卡 + 拼参数 + 启动 (有检查点自动续训)
+  watch_pretrain.sh    # 守护: 训练被杀自动重选卡续训
+  status.sh            # 状态速查 (进度/吞吐/剩余时间/显存)
+  run_sft.sh  run_grpo.sh  run_eval.sh
+  test_resume_accounting.py   # 断点续训记账的 CPU 冒烟测试
 ```
 
 ## 🚀 复现
@@ -71,28 +80,27 @@ scripts/
 bash scripts/server_setup.sh
 
 # 2. 分词器 (2 亿字符语料, ~20min)
-python src/tokenizer_train.py --out_dir /root/Test/mini-r1/tokenizer
+python src/tokenizer_train.py --out_dir $PROJ/tokenizer
 
-# 3. 数据 (sample-10BT, ~1-2h 视网速)
-python src/data_pretrain.py --tokenizer /root/Test/mini-r1/tokenizer/tokenizer.json \
-    --out_dir /root/Test/mini-r1/data
+# 3. 数据 (FineWeb-Edu sample-10BT, ~1-2h 视网速)
+python src/data_pretrain.py --tokenizer $PROJ/tokenizer/tokenizer.json --out_dir $PROJ/data
 
-# 4. 预训练 (3 卡, ~10B tokens, 约 1 天 GPU 时)
-torchrun --nproc_per_node=3 src/train_pretrain.py \
-    --data_dir /root/Test/mini-r1/data --ckpt_dir /root/Test/mini-r1/ckpts/pretrain
+# 4. 预训练 (5B tokens; 单卡约 3.5 天, 会按空闲显存自动选卡)
+bash scripts/run_pretrain.sh 1
+bash scripts/run_watch.sh          # 守护, 被杀自动续训 (共享机器上建议开)
+bash scripts/status.sh             # 随时查进度
 
 # 5. SFT
-python src/train_sft.py --base_ckpt /root/Test/mini-r1/ckpts/pretrain/latest.pt \
-    --out_dir /root/Test/mini-r1/ckpts/sft
+bash scripts/run_sft.sh
 
 # 6. GRPO
-python src/train_grpo.py --base_ckpt /root/Test/mini-r1/ckpts/sft/sft.pt \
-    --out_dir /root/Test/mini-r1/ckpts/grpo
+bash scripts/run_grpo.sh
 
 # 7. 评测 (SFT vs GRPO 对比)
-python src/eval_gsm8k.py --ckpt /root/Test/mini-r1/ckpts/sft/sft.pt --n_samples 8
-python src/eval_gsm8k.py --ckpt /root/Test/mini-r1/ckpts/grpo/grpo.pt --n_samples 8
+bash scripts/run_eval.sh
 ```
+
+> 详细的踩坑记录、设计取舍、以及接手项目要看的东西，都在 [AGENTS.md](AGENTS.md)。
 
 ## 📊 实验结果
 
