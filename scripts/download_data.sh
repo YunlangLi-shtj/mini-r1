@@ -23,7 +23,9 @@ for i in $(seq $START $((START + COUNT - 1))); do
       echo "跳过 (已存在): $f"
     else
       echo "下载 $f ..."
-      curl -sL -C - --retry 5 --retry-delay 3 --connect-timeout 20 \
+      # --max-time: 单次尝试上限 (卡死自动重来); --speed-time: 60s 均速 <1KB/s 即断
+      curl -sL -C - --retry 10 --retry-delay 3 --connect-timeout 20 \
+        --max-time 600 --speed-time 60 --speed-limit 1024 \
         -o "$f.part" "$BASE/$f" && mv "$f.part" "$f" && echo "完成: $f"
     fi
   ) &

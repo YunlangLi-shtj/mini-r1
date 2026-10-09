@@ -175,7 +175,8 @@ class MiniR1Model(nn.Module):
         logits = F.linear(x, w)
         if targets is None:
             return logits
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        # reshape 而非 view: F.linear 输出/切片 targets 可能非连续 (CPU/fp32 路径会炸)
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return loss, logits
 
     @torch.no_grad()
