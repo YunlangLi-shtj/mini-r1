@@ -44,15 +44,16 @@ class ShardLoader:
 
     def next_batch(self, batch_size, device):
         """返回 (x, y) 各 (B, T), 不足一个分片末尾时跨分片续读。"""
-        B, T = self.seq_len, self.seq_len
+        T = self.seq_len
         x = torch.empty(batch_size, T + 1, dtype=torch.long)
         for i in range(batch_size):
-            row = []
-            while len(row) < T + 1:
+            row, n = [], 0
+            while n < T + 1:
                 m = self.maps[self.shard]
-                take = min(T + 1 - len(row), m.size - self.pos)
+                take = min(T + 1 - n, m.size - self.pos)
                 row.append(m[self.pos:self.pos + take])
                 self.pos += take
+                n += take
                 if self.pos >= m.size:          # 转到下一个分片
                     self.shard = (self.shard + 1) % len(self.maps)
                     self.pos = 0
@@ -195,6 +196,7 @@ def evaluate(model, data_dir, seq_len, device, n_batches=20):
     val = np.memmap(f"{data_dir}/val.bin", dtype=np.uint32, mode="r")
     model.eval()
     losses = []
+    n_batches = min(n_batches, val.size // (seq_len * 2 + 1))
     for i in range(n_batches):
         start = i * seq_len * 2
         chunk = torch.from_numpy(val[start:start + seq_len * 2 + 1].astype(np.int64)).to(device)
