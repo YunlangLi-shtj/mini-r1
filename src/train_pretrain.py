@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--grad_ckpt", action="store_true", default=True)
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
+    os.makedirs(args.ckpt_dir, exist_ok=True)
 
     # ---- 分布式初始化 ----
     ddp = "RANK" in os.environ
@@ -165,11 +166,10 @@ def main():
             print(f"  >> val loss {val_loss:.4f}", flush=True)
             logf.write(json.dumps({"step": step, "val_loss": val_loss}) + "\n"); logf.flush()
 
-        if step % args.ckpt_every == 0 and step > 0:
+        if step % args.ckpt_every == 0 and step > 0 and master:
             torch.save({"step": step, "model": (model.module if ddp else model).state_dict(),
                         "opt": opt.state_dict()}, f"{args.ckpt_dir}/latest.pt")
-            if master:
-                print(f"  >> checkpoint saved @ step {step}")
+            print(f"  >> checkpoint saved @ step {step}")
     print(f"[rank{rank}] 训练完成")
 
 

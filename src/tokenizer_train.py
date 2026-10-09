@@ -37,9 +37,9 @@ def main():
     def text_gen():
         total = 0
         for i, sample in enumerate(ds):
-            if i >= args.num_shards * 10_000:      # 每个分片约 1 万行, 控制总量
-                break
-            total += 1
+            if i >= args.num_shards * 10_000 or total >= args.max_chars:
+                break                      # 每个分片约 1 万行, 且受字符总量上限约束
+            total += len(sample["text"])
             yield sample["text"]
 
     # 2. 训练 BPE (底层 Rust 实现, 2 亿字符约 10-20 分钟)

@@ -24,9 +24,16 @@ EOT = 2                          # </s>, 文档间分隔符
 NUM_PROC = 8                     # tokenize 子进程数 (共享机器, 克制使用)
 
 
+_TOK_CACHE = {}
+
 def tokenize_batch(batch, tokenizer_path):
-    """对一批文档做 BPE 编码, 每篇末尾追加 </s>。datasets.map 的 batched 回调。"""
-    tok = Tokenizer.from_file(tokenizer_path)
+    """对一批文档做 BPE 编码, 每篇末尾追加 </s>。datasets.map 的 batched 回调。
+
+    每个 worker 进程缓存一份分词器, 避免每批重复加载 (10B tokens 有 30 万批)。
+    """
+    tok = _TOK_CACHE.get(tokenizer_path)
+    if tok is None:
+        tok = _TOK_CACHE[tokenizer_path] = Tokenizer.from_file(tokenizer_path)
     out = tok.encode_batch(batch["text"])
     return {"ids": [e.ids + [EOT] for e in out]}
 

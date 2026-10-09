@@ -42,10 +42,15 @@ def precompute_rope(max_seq_len: int, head_dim: int, theta: float, device) -> to
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """对 (..., seq, head_dim) 张量施加旋转位置编码。"""
+    """对 (..., seq, head_dim) 张量施加旋转位置编码。
+
+    cos/sin 需已与 x 的 (..., seq, head_dim) 形状广播兼容 (见 Attention.forward)。
+    旋转: [x1;x2] -> [x1*cos - x2*sin; x1*sin + x2*cos], 按 head_dim 对半。
+    """
     d = x.shape[-1] // 2
+    c, s = cos[..., :d], sin[..., :d]
     x1, x2 = x[..., :d], x[..., d:]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
 
 
 class RMSNorm(nn.Module):
@@ -82,6 +87,8 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+        cos = cos[None, :, None, :]                          # (T, d) -> (1, T, 1, d)
+        sin = sin[None, :, None, :]
         q = apply_rope(q, cos, sin).transpose(1, 2)          # (B, n_heads, T, d)
         k = apply_rope(k, cos, sin).transpose(1, 2)          # (B, n_kv_heads, T, d)
         v = v.transpose(1, 2)
