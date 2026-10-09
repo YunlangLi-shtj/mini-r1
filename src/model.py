@@ -41,6 +41,26 @@ def precompute_rope(max_seq_len: int, head_dim: int, theta: float, device) -> to
     return emb.cos(), emb.sin()
 
 
+def chunked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor,
+                          chunk_rows: int = 2048) -> torch.Tensor:
+    """分块计算交叉熵, 等价于 F.cross_entropy(logits, targets)。
+
+    为什么要分块: 词表 152k 时, log_softmax 要在 fp32 下铺一张 (行数 x 词表) 的临时张量。
+    micro_batch 4 x seq 2048 = 8192 行 -> 8192*152064*4B ≈ 4.6GB 的**单次分配**,
+    比模型本身的 logits 还大一倍, 是 24G 卡上真正撑爆显存的那一项。
+    按 2048 行分块后, 峰值降到 2048*152064*4B ≈ 1.2GB, 数值上完全等价。
+    """
+    v = logits.size(-1)
+    total, count = logits.new_zeros(()), targets.new_zeros(())
+    for i in range(0, logits.size(0), chunk_rows):
+        lg = logits[i:i + chunk_rows]
+        tg = targets[i:i + chunk_rows]
+        total = total + F.cross_entropy(lg.reshape(-1, v).float(), tg.reshape(-1),
+                                        reduction="sum")
+        count = count + (tg != -100).sum()
+    return total / count.clamp(min=1)
+
+
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """对 (..., seq, head_dim) 张量施加旋转位置编码。
 
@@ -176,7 +196,7 @@ class MiniR1Model(nn.Module):
         if targets is None:
             return logits
         # reshape 而非 view: F.linear 输出/切片 targets 可能非连续 (CPU/fp32 路径会炸)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        loss = chunked_cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return loss, logits
 
     @torch.no_grad()
@@ -205,6 +225,23 @@ class MiniR1Model(nn.Module):
     @property
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+def enable_grad_checkpointing(model: MiniR1Model) -> None:
+    """打开逐层激活重算 (显存换时间, 24G 卡上跑大微批次的关键)。
+
+    注意: 必须捕获替换前的绑定方法, 否则 checkpoint 重算时会经 __call__ 再次进入
+    被替换过的 fwd, 导致无限递归 (RecursionError)。
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    def make_forward(orig_forward):
+        def fwd(x, cos, sin, mask=None):
+            return checkpoint(orig_forward, x, cos, sin, mask, use_reentrant=False)
+        return fwd
+
+    for layer in model.layers:
+        layer.forward = make_forward(layer.forward)
 
 
 def create_model(device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> MiniR1Model:

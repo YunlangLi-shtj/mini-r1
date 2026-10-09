@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from model import MiniR1Model, ModelConfig
+from model import MiniR1Model, ModelConfig, enable_grad_checkpointing
 
 # ---------------- 数据: memmap 分片顺序流 ----------------
 
@@ -86,6 +86,7 @@ def main():
     ap.add_argument("--min_lr", type=float, default=1e-4)
     ap.add_argument("--warmup_steps", type=int, default=500)
     ap.add_argument("--max_steps", type=int, default=0)        # 0 = 跑完整数据集一遍
+    ap.add_argument("--max_tokens", type=int, default=0)       # 0 = 跑完整数据集一遍 (优先于此)
     ap.add_argument("--val_every", type=int, default=500)
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--ckpt_every", type=int, default=2000)
@@ -112,17 +113,7 @@ def main():
     cfg = ModelConfig(max_seq_len=args.seq_len)
     model = MiniR1Model(cfg).to(device)
     if args.grad_ckpt:
-        # 激活值逐层重算: 显存换时间, 24G 卡跑大微批次的关键
-        # 注意: 必须捕获替换前的绑定方法, 否则 checkpoint 重算时
-        # l(x,cos,sin) 会经 __call__ 再进入被替换的 fwd -> 无限递归
-        from torch.utils.checkpoint import checkpoint
-        for layer in model.layers:
-            orig = layer.forward
-            def make_forward(orig_forward):
-                def fwd(x, cos, sin, mask=None):
-                    return checkpoint(orig_forward, x, cos, sin, mask, use_reentrant=False)
-                return fwd
-            layer.forward = make_forward(orig)
+        enable_grad_checkpointing(model)
     if master:
         print(f"模型参数量: {model.num_params/1e6:.1f}M | DDP={ddp} world={world} | grad_ckpt={args.grad_ckpt}")
     if ddp:
@@ -131,29 +122,41 @@ def main():
     # ---- 优化器 ----
     opt = torch.optim.AdamW(param_groups(model), lr=args.peak_lr,
                             betas=(0.9, 0.95), eps=1e-8)
-    step0 = 0
+
+    # ---- 进度记账: 以「已消耗 token 数」为准, 不用 step 推算 ----
+    # world (卡数) 是每步 token 量的因子。共享机器上守护脚本每次重启用几张卡是随机的,
+    # 若按 step*tok_per_step 推算数据偏移, 换卡后续训会跳到错误位置 (漏读/重读大量数据),
+    # 所以检查点里存绝对的 tokens_seen; LR 调度也用 token 换算出的「全局步数」, 保证与卡数无关。
+    ref_tps = args.seq_len * args.micro_batch * args.grad_accum      # world=1 时每步 token
+    tok_per_step = ref_tps * world
+    start_tokens, ckpt_step = 0, 0
     if args.resume:
         ckpt = torch.load(f"{args.ckpt_dir}/latest.pt", map_location=device)
         (model.module if ddp else model).load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
-        step0 = ckpt["step"]
+        ckpt_step = ckpt.get("step", 0)
+        start_tokens = ckpt.get("tokens_seen", ckpt_step * ref_tps)   # 兼容旧检查点
 
     # ---- 数据 (续训时跳过已训 token) ----
-    tok_per_step = args.seq_len * args.micro_batch * args.grad_accum * world
-    loader = ShardLoader(args.data_dir, args.seq_len, rank, world,
-                         start_pos=step0 * tok_per_step)
+    loader = ShardLoader(args.data_dir, args.seq_len, rank, world, start_pos=start_tokens)
+    target_tokens = args.max_tokens or (args.max_steps * ref_tps if args.max_steps else loader.n_tokens)
+    total_steps = max(1, target_tokens // ref_tps)                   # 全局步数 (LR 调度用)
+    n_steps = max(0, (target_tokens - start_tokens) // tok_per_step)  # 本次进程要跑的步数
     if master:
-        print(f"数据总量: {loader.n_tokens/1e9:.2f}B tokens")
-    max_steps = args.max_steps or max(1, loader.n_tokens // (args.seq_len * args.micro_batch * args.grad_accum * world))
-    print(f"[rank{rank}] 计划步数: {max_steps}")
+        print(f"数据总量: {loader.n_tokens/1e9:.2f}B tokens | 目标: {target_tokens/1e9:.2f}B tokens")
+        print(f"起点: {start_tokens:,} tokens ({start_tokens/1e9:.3f}B) | ckpt step {ckpt_step} | "
+              f"world={world} | 每步 {tok_per_step:,} tokens")
+        print(f"[rank{rank}] 本次计划步数: {n_steps} (全局共 {total_steps})")
 
     # ---- 训练循环 ----
     logf = open(f"{args.ckpt_dir}/train_log.jsonl", "a")
     t0, running = time.time(), 0.0
     torch.backends.cuda.matmul.allow_tf32 = True
     model.train()
-    for step in range(step0, max_steps):
-        lr = lr_schedule(step, args)
+    done = start_tokens
+    global_step = start_tokens // ref_tps
+    for i in range(n_steps):
+        lr = lr_schedule(global_step, args, total_steps)
         for g in opt.param_groups:
             g["lr"] = lr
         opt.zero_grad(set_to_none=True)
@@ -165,53 +168,63 @@ def main():
             running += loss.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        done = start_tokens + (i + 1) * tok_per_step
+        global_step = done // ref_tps
 
-        if step % args.log_every == 0 and master:
-            n_loss = min(step + 1, args.log_every) * args.grad_accum  # 开头不足一个窗口
-            loss_avg = running / n_loss
-            tps = args.seq_len * args.micro_batch * args.grad_accum * world * args.log_every / (time.time() - t0)
-            print(f"step {step:6d}/{max_steps} | loss {loss_avg:.4f} | lr {lr:.2e} | {tps:,.0f} tok/s", flush=True)
-            logf.write(json.dumps({"step": step, "loss": loss_avg, "lr": lr}) + "\n"); logf.flush()
+        if i % args.log_every == 0 and master:
+            window = min(i + 1, args.log_every)      # 开头不足一个窗口
+            loss_avg = running / (window * args.grad_accum)
+            tps = tok_per_step * window / (time.time() - t0)
+            print(f"step {global_step:6d}/{total_steps} | {done/1e9:.3f}B tok | "
+                  f"loss {loss_avg:.4f} | lr {lr:.2e} | {tps:,.0f} tok/s", flush=True)
+            logf.write(json.dumps({"step": global_step, "tokens": done, "loss": loss_avg,
+                                   "lr": lr, "tok_per_s": tps}) + "\n"); logf.flush()
             running, t0 = 0.0, time.time()
 
-        if step % args.val_every == 0 and master:
+        if i % args.val_every == 0 and master:
             val_loss = evaluate(model, args.data_dir, args.seq_len, device)
-            print(f"  >> val loss {val_loss:.4f}", flush=True)
-            logf.write(json.dumps({"step": step, "val_loss": val_loss}) + "\n"); logf.flush()
+            if val_loss is not None:
+                print(f"  >> val loss {val_loss:.4f}", flush=True)
+                logf.write(json.dumps({"step": global_step, "tokens": done,
+                                       "val_loss": val_loss}) + "\n"); logf.flush()
 
-        if step % args.ckpt_every == 0 and step > 0 and master:
-            save_ckpt(model, opt, args.ckpt_dir, step, ddp, device)
-            print(f"  >> checkpoint saved @ step {step}", flush=True)
+        if (i + 1) % args.ckpt_every == 0 and master:
+            save_ckpt(model, opt, args.ckpt_dir, global_step, done, ddp)
+            print(f"  >> checkpoint saved @ step {global_step} ({done/1e9:.3f}B tok)", flush=True)
     if master:
-        # 收尾保存: max_steps 不是 ckpt_every 整数倍时, 否则最后一个检查点偏旧
-        save_ckpt(model, opt, args.ckpt_dir, max_steps, ddp, device)
-        print(f"  >> 最终 checkpoint saved @ step {max_steps}", flush=True)
+        # 收尾保存: 否则最后一段进度 (不足 ckpt_every 的部分) 会丢
+        save_ckpt(model, opt, args.ckpt_dir, global_step, done, ddp)
+        print(f"  >> 最终 checkpoint saved @ step {global_step} ({done/1e9:.3f}B tok)", flush=True)
     print(f"[rank{rank}] 训练完成")
 
 
-def save_ckpt(model, opt, ckpt_dir, step, ddp, device):
+def save_ckpt(model, opt, ckpt_dir, step, tokens_seen, ddp):
     """原子写检查点: 先写 .tmp 再 os.replace。
     共享机器上训练随时可能被杀, 直接覆盖 latest.pt 若中途被杀会留下损坏文件,
-    下次 --resume 就再也起不来了。"""
+    下次 --resume 就再也起不来了。tokens_seen 是绝对进度, 换卡数也能正确续训。"""
     path = f"{ckpt_dir}/latest.pt"
     tmp = f"{path}.tmp"
-    torch.save({"step": step, "model": (model.module if ddp else model).state_dict(),
+    torch.save({"step": step, "tokens_seen": tokens_seen,
+                "model": (model.module if ddp else model).state_dict(),
                 "opt": opt.state_dict()}, tmp)
     os.replace(tmp, path)
 
 
-def lr_schedule(step, args):
-    """warmup + 余弦退火到 min_lr。"""
+def lr_schedule(step, args, total_steps):
+    """warmup + 余弦退火到 min_lr (step 为与卡数无关的全局步数)。"""
     if step < args.warmup_steps:
-        return args.peak_lr * step / args.warmup_steps
-    p = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
-    return args.min_lr + 0.5 * (args.peak_lr - args.min_lr) * (1 + math.cos(math.pi * p))
+        return args.peak_lr * max(step, 1) / args.warmup_steps
+    p = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+    return args.min_lr + 0.5 * (args.peak_lr - args.min_lr) * (1 + math.cos(math.pi * min(p, 1.0)))
 
 
 @torch.no_grad()
 def evaluate(model, data_dir, seq_len, device, n_batches=20):
-    """验证集上取平均交叉熵。"""
-    val = np.memmap(f"{data_dir}/val.bin", dtype=np.uint32, mode="r")
+    """验证集上取平均交叉熵。val.bin 由数据管线最后一步生成, 还没有就跳过验证。"""
+    path = f"{data_dir}/val.bin"
+    if not os.path.exists(path):
+        return None
+    val = np.memmap(path, dtype=np.uint32, mode="r")
     model.eval()
     losses = []
     n_batches = min(n_batches, val.size // (seq_len + 1))
