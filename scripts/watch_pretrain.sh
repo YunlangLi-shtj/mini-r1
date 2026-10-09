@@ -20,7 +20,13 @@ trap 'rm -f "$PIDF"' EXIT
 WLOG=logs/pretrain_watch.log
 LOG=logs/pretrain.log
 CKPT=ckpts/pretrain/latest.pt
-MAX_GPUS=2                 # 卡太紧时先保 1-2 张能跑起来; 双卡 DDP 需要每卡 11G+ 空闲
+MAX_GPUS=1                 # ★ 实测多卡更慢, 锁死单卡
+                           # 2026-10-09 实测: 单卡 16,000 tok/s; 双卡 DDP 只有 4,000 tok/s
+                           # (梯度累积没关同步 + 卡还被别人共占, 通信把算力吃光了),
+                           # 而且双卡要每卡 12.6G, 在满负荷的机器上反复 OOM ——
+                           # 20:36~22:12 一个半小时里崩了 103 次, 几乎没进展。
+                           # 换卡逻辑 (#4) 也就此失效: cur=1 时永远不满足 cur < MAX_GPUS。
+                           # 想重新启用多卡: 先确认 train_pretrain.py 里 no_sync 生效, 再实测吞吐。
 MIN_FREE_MB=11800          # 单卡空闲显存门槛, 必须与 run_pretrain.sh 里的一致
                            # 以 nvidia-smi 口径实测占 ~10.8G (probe_mem.py 只报 8.19G, 偏乐观)
 FRESH_SEC=600              # 换卡前等到一个 10 分钟内的检查点, 少丢重跑

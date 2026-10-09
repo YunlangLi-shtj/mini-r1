@@ -9,6 +9,7 @@
   python train_pretrain.py --data_dir ... --ckpt_dir ... --micro_batch 4 --grad_accum 2
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -174,9 +175,16 @@ def main():
         opt.zero_grad(set_to_none=True)
         for micro in range(args.grad_accum):
             x, y = loader.next_batch(args.micro_batch, device)
-            with torch.autocast("cuda", torch.bfloat16):
-                loss, _ = model(x, y)
-            (loss / args.grad_accum).backward()
+            # 梯度累积期间必须关掉 DDP 的梯度同步 (no_sync), 只在最后一次 backward 时
+            # all-reduce 一遍。否则每累积一步就同步一次 —— grad_accum=64 时白做 63 次
+            # 全量梯度通信, 通信量直接乘以 64。实测: 漏掉它时 2 卡只有 4,000 tok/s,
+            # 比单卡 16,000 tok/s 还慢 4 倍 (通信把算力全吃掉了)。
+            sync_ctx = model.no_sync() if (ddp and micro < args.grad_accum - 1) \
+                else contextlib.nullcontext()
+            with sync_ctx:
+                with torch.autocast("cuda", torch.bfloat16):
+                    loss, _ = model(x, y)
+                (loss / args.grad_accum).backward()
             running += loss.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
