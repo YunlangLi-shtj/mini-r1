@@ -40,40 +40,33 @@ def tokenize_batch(batch, tokenizer_path):
     return {"ids": [e.ids + [EOT] for e in out]}
 
 
-def consume(tok_ds, out_dir: str, is_val: bool, log_every: int = 5):
-    """把 tokenize 后的批次流写入二进制分片, 返回写入的总 token 数。"""
-    if is_val:
-        path = f"{out_dir}/val.bin"
-        f = open(path, "wb")
-        total = 0
-        for batch in tok_ds:
-            for ids in batch["ids"]:
-                f.write(struct.pack(f"{len(ids)}I", *ids))
-                total += len(ids)
-        f.close()
-        print(f"验证集完成: {total:,} tokens -> {path}")
-        return total
+class ShardWriter:
+    """把 tokenize 后的文档流写入 1 亿 token/片的 uint32 分片, 状态跨文件延续。"""
 
-    buf = np.empty(TOKENS_PER_SHARD, dtype=np.uint32)
-    shard_idx, pos, total = 0, 0, 0
-    t0 = time.time()
-    for batch in tok_ds:
-        for ids in batch["ids"]:
-            n = len(ids)
-            if pos + n > TOKENS_PER_SHARD:
-                buf[pos:].tofile(f"{out_dir}/train/shard_{shard_idx:05d}.bin")
-                shard_idx += 1
-                pos = 0
-            buf[pos:pos + n] = ids
-            pos += n
-            total += n
-            if total % (TOKENS_PER_SHARD // 4) < 256:
-                rate = total / (time.time() - t0)
-                print(f"  {total:,} tokens, {rate:,.0f} tok/s, shard={shard_idx}", flush=True)
-    if pos:
-        buf[:pos].tofile(f"{out_dir}/train/shard_{shard_idx:05d}.bin")
-    print(f"训练集完成: {total:,} tokens, {shard_idx + 1} 个分片")
-    return total
+    def __init__(self, out_dir: str):
+        self.out_dir = out_dir
+        self.buf = np.empty(TOKENS_PER_SHARD, dtype=np.uint32)
+        self.shard_idx, self.pos, self.total = 0, 0, 0
+        self.t0 = time.time()
+
+    def write(self, ids):
+        n = len(ids)
+        if self.pos + n > TOKENS_PER_SHARD:
+            self.buf[self.pos:].tofile(f"{self.out_dir}/train/shard_{self.shard_idx:05d}.bin")
+            self.shard_idx += 1
+            self.pos = 0
+        self.buf[self.pos:self.pos + n] = ids
+        self.pos += n
+        self.total += n
+        if self.total % (TOKENS_PER_SHARD // 4) < 256:
+            rate = self.total / (time.time() - self.t0)
+            print(f"  {self.total:,} tokens, {rate:,.0f} tok/s, shard={self.shard_idx}", flush=True)
+
+    def close(self):
+        if self.pos:
+            self.buf[:self.pos].tofile(f"{self.out_dir}/train/shard_{self.shard_idx:05d}.bin")
+        print(f"训练集完成: {self.total:,} tokens, {self.shard_idx + 1} 个分片")
+        return self.total
 
 
 def main():
@@ -93,24 +86,49 @@ def main():
         assert files, f"{args.local_dir} 下没有 parquet 文件"
         # 行数从 parquet 元数据直接读, 不用遍历 (每个文件只需读 footer)
         n = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
-        ds = load_dataset("parquet", data_files=files, split="train", streaming=True)
         print(f"本地 {len(files)} 个 parquet, 共 {n:,} 篇文档 (元数据统计)")
+        print(f"验证集取末尾 {args.val_docs} 篇 (最后一个文件)")
+
+        # streaming 的 map 不支持 num_proc, 改逐文件非流式加载:
+        # 内存峰值 = 单文件文本 (~8GB) + ids, 而不是全量 100GB+
+        map_kwargs = dict(batched=True, batch_size=64, num_proc=NUM_PROC,
+                          fn_kwargs={"tokenizer_path": args.tokenizer},
+                          remove_columns=["text"])
+        writer = ShardWriter(args.out_dir)
+        for idx, f in enumerate(files):
+            print(f"[{idx + 1}/{len(files)}] 处理 {os.path.basename(f)} ...")
+            ds = load_dataset("parquet", data_files=f, split="train")
+            if idx == len(files) - 1 and args.val_docs > 0:
+                val = ds.select(range(len(ds) - args.val_docs, len(ds)))
+                val = val.map(tokenize_batch, **map_kwargs)
+                total = 0
+                with open(f"{args.out_dir}/val.bin", "wb") as fv:
+                    for batch in val:
+                        for ids in batch["ids"]:
+                            fv.write(struct.pack(f"{len(ids)}I", *ids))
+                            total += len(ids)
+                print(f"验证集完成: {total:,} tokens -> {args.out_dir}/val.bin")
+                del val
+                ds = ds.select(range(len(ds) - args.val_docs))
+            ds = ds.map(tokenize_batch, **map_kwargs)
+            for batch in ds:
+                for ids in batch["ids"]:
+                    writer.write(ids)
+            del ds
+        writer.close()
     else:
         ds = load_dataset(args.dataset, args.name, split="train", streaming=True)
         n = ds.info.splits["train"].num_examples
         print(f"数据集共 {n:,} 篇文档")
-    print(f"验证集取末尾 {args.val_docs} 篇")
-
-    # streaming 模式下 features 可能尚未初始化, 防御一下
-    feats = getattr(ds, "features", None)
-    map_kwargs = dict(batched=True, batch_size=64, num_proc=NUM_PROC,
-                      fn_kwargs={"tokenizer_path": args.tokenizer},
-                      remove_columns=list(feats.keys()) if feats else None)
-
-    # 末尾 val_docs 篇 -> 验证集, 其余 -> 训练分片
-    consume(ds.skip(n - args.val_docs).map(tokenize_batch, **map_kwargs),
-            args.out_dir, is_val=True)
-    consume(ds.map(tokenize_batch, **map_kwargs), args.out_dir, is_val=False)
+        # hub 流式回退: 单进程 map (慢, 仅作备用路径)
+        ds = ds.map(tokenize_batch, batched=True, batch_size=64,
+                    fn_kwargs={"tokenizer_path": args.tokenizer},
+                    remove_columns=list(ds.features.keys()) if ds.features else None)
+        writer = ShardWriter(args.out_dir)
+        for batch in ds:
+            for ids in batch["ids"]:
+                writer.write(ids)
+        writer.close()
 
 
 if __name__ == "__main__":
