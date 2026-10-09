@@ -2,14 +2,16 @@
 从零训练 BPE 分词器 (byte-level BPE, 与 Qwen/GPT 系列同款算法)
 
 流程:
-  1. 从 FineWeb-Edu 下载若干 parquet 分片作为训练语料 (~2GB 文本, 采样 2 亿字符)
+  1. 从本地 FineWeb-Edu parquet 分片读取训练语料 (采样 2 亿字符)
   2. 用 tokenizers 库训练 BPE: vocab 152064, 覆盖 99.99% 常见字节对
   3. 保存 tokenizer.json, 并导出 vocab 供数据管线使用
 
 用法:
-  python tokenizer_train.py --data_dir /path/to/data --out_dir /path/to/tokenizer
+  python tokenizer_train.py --local_dir /root/Test/mini-r1/data/raw \
+      --out_dir /root/Test/mini-r1/tokenizer
 """
 import argparse
+import glob
 import os
 
 from datasets import load_dataset
@@ -17,27 +19,33 @@ from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
 VOCAB_SIZE = 152064          # 与 Qwen2 系列一致
 SPECIAL_TOKENS = ["<unk>", "<s>", "</s>", "<pad>", "<|im_start|>", "<|im_end|>"]
-NUM_SHARDS = 24              # fineweb-edu 分片数 (每个 ~1GB, 抽其中的文本)
 MAX_CHARS = 200_000_000      # BPE 训练语料上限 (2 亿字符, 约 50M token)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
-    ap.add_argument("--num_shards", type=int, default=NUM_SHARDS)
+    ap.add_argument("--local_dir", default=None,
+                    help="从本地 parquet 目录读取 (绕过 HF 数据集枚举)")
     ap.add_argument("--max_chars", type=int, default=MAX_CHARS)
     ap.add_argument("--out_dir", default="/root/Test/mini-r1/tokenizer")
     args = ap.parse_args()
 
-    # 1. 流式读取前 N 个分片, 只取 text 列 (streaming 模式不落盘)
-    print(f"[1/3] 流式读取 {args.dataset} 前 {args.num_shards} 个分片 ...")
-    ds = load_dataset(args.dataset, split="train", streaming=True)
+    # 1. 流式读取 parquet, 只取 text 列 (streaming 模式不落盘)
+    if args.local_dir:
+        files = sorted(glob.glob(f"{args.local_dir}/*.parquet"))
+        assert files, f"{args.local_dir} 下没有 parquet 文件"
+        print(f"[1/3] 从本地读取 {len(files)} 个 parquet 分片 ...")
+        ds = load_dataset("parquet", data_files=files, split="train", streaming=True)
+    else:
+        print(f"[1/3] 流式读取 {args.dataset} ...")
+        ds = load_dataset(args.dataset, split="train", streaming=True)
 
     def text_gen():
         total = 0
-        for i, sample in enumerate(ds):
-            if i >= args.num_shards * 10_000 or total >= args.max_chars:
-                break                      # 每个分片约 1 万行, 且受字符总量上限约束
+        for sample in ds:
+            if total >= args.max_chars:
+                break
             total += len(sample["text"])
             yield sample["text"]
 

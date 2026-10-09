@@ -101,10 +101,14 @@ def grpo_loss(logps_new, logps_old, adv, ref_logps, beta, eps=0.2):
 
 # ---------------- 数据 ----------------
 
-def load_gsm8k(tokenizer_path, n_eval=256):
+def load_gsm8k(tokenizer_path, n_eval=256, gsm8k_dir=None):
     """GSM8K: 训练集做 rollout, 测试集前 n_eval 题做训练中评测。"""
-    train = load_dataset("openai/gsm8k", "main", split="train")
-    test = load_dataset("openai/gsm8k", "main", split="test")
+    if gsm8k_dir:   # 本地 parquet (绕过 HF 数据集枚举)
+        train = load_dataset("parquet", data_files=f"{gsm8k_dir}/train.parquet", split="train")
+        test = load_dataset("parquet", data_files=f"{gsm8k_dir}/test.parquet", split="train")
+    else:
+        train = load_dataset("openai/gsm8k", "main", split="train")
+        test = load_dataset("openai/gsm8k", "main", split="test")
     tok = Tokenizer.from_file(tokenizer_path)
     prep = lambda batch: {
         "ids": [tok.encode(PROMPT_TMPL.format(question=q)).ids
@@ -134,6 +138,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base_ckpt", required=True)        # SFT 检查点
     ap.add_argument("--tokenizer", default="/root/Test/mini-r1/tokenizer/tokenizer.json")
+    ap.add_argument("--gsm8k_dir", default=None,
+                    help="本地 gsm8k parquet 目录 (绕过 HF 数据集枚举)")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--G", type=int, default=8)          # 每 prompt 采样数
     ap.add_argument("--rollout_batch", type=int, default=24)   # 每步 prompt 数
@@ -151,7 +157,7 @@ def main():
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_ds, eval_ds, tok = load_gsm8k(args.tokenizer)
+    train_ds, eval_ds, tok = load_gsm8k(args.tokenizer, gsm8k_dir=args.gsm8k_dir)
     print(f"GSM8K: 训练 {len(train_ds)} 题, 评测 {len(eval_ds)} 题")
 
     # ---- 策略模型 (待优化) 与参考模型 (冻结) ----

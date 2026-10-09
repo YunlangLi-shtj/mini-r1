@@ -5,16 +5,18 @@
   {out_dir}/train/shard_{i:05d}.bin    每片 1 亿 token, uint32
   {out_dir}/val.bin                    末尾 1 万篇文档作为验证集
 
-用法:
-  python data_pretrain.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT \
+用法 (本地 parquet, 绕过 HF 数据集枚举):
+  python data_pretrain.py --local_dir /root/Test/mini-r1/data/raw \
       --tokenizer /root/Test/mini-r1/tokenizer/tokenizer.json --out_dir /root/Test/mini-r1/data
 """
 import argparse
+import glob
 import os
 import struct
 import time
 
 import numpy as np
+import pyarrow.parquet as pq
 from datasets import load_dataset
 from tokenizers import Tokenizer
 
@@ -78,19 +80,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     ap.add_argument("--name", default="sample-10BT")
+    ap.add_argument("--local_dir", default=None,
+                    help="从本地 parquet 目录读取 (绕过 HF 数据集枚举)")
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--val_docs", type=int, default=VAL_DOCS)
     args = ap.parse_args()
 
     os.makedirs(f"{args.out_dir}/train", exist_ok=True)
-    ds = load_dataset(args.dataset, args.name, split="train", streaming=True)
-    n = ds.info.splits["train"].num_examples
-    print(f"数据集共 {n:,} 篇文档, 验证集取末尾 {args.val_docs} 篇")
+    if args.local_dir:
+        files = sorted(glob.glob(f"{args.local_dir}/*.parquet"))
+        assert files, f"{args.local_dir} 下没有 parquet 文件"
+        # 行数从 parquet 元数据直接读, 不用遍历 (每个文件只需读 footer)
+        n = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+        ds = load_dataset("parquet", data_files=files, split="train", streaming=True)
+        print(f"本地 {len(files)} 个 parquet, 共 {n:,} 篇文档 (元数据统计)")
+    else:
+        ds = load_dataset(args.dataset, args.name, split="train", streaming=True)
+        n = ds.info.splits["train"].num_examples
+        print(f"数据集共 {n:,} 篇文档")
+    print(f"验证集取末尾 {args.val_docs} 篇")
 
+    # streaming 模式下 features 可能尚未初始化, 防御一下
+    feats = getattr(ds, "features", None)
     map_kwargs = dict(batched=True, batch_size=64, num_proc=NUM_PROC,
                       fn_kwargs={"tokenizer_path": args.tokenizer},
-                      remove_columns=list(ds.features.keys()))
+                      remove_columns=list(feats.keys()) if feats else None)
 
     # 末尾 val_docs 篇 -> 验证集, 其余 -> 训练分片
     consume(ds.skip(n - args.val_docs).map(tokenize_batch, **map_kwargs),

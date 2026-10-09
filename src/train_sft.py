@@ -62,6 +62,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base_ckpt", required=True)
     ap.add_argument("--tokenizer", default="/root/Test/mini-r1/tokenizer/tokenizer.json")
+    ap.add_argument("--data_file", default=None,
+                    help="本地 OpenHermes json 文件 (绕过 HF 数据集枚举)")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--max_samples", type=int, default=200000)
     ap.add_argument("--max_len", type=int, default=2048)
@@ -76,7 +78,10 @@ def main():
     tok = Tokenizer.from_file(args.tokenizer)
 
     # ---- 数据: OpenHermes-2.5, 过滤过长样本 ----
-    ds = load_dataset("teknium/OpenHermes-2.5", split="train")
+    if args.data_file:
+        ds = load_dataset("json", data_files=args.data_file, split="train")
+    else:
+        ds = load_dataset("teknium/OpenHermes-2.5", split="train")
     ds = ds.select(range(min(args.max_samples, len(ds))))
     print(f"SFT 样本数: {len(ds):,}")
 

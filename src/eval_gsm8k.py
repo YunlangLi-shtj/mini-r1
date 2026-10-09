@@ -24,6 +24,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--tokenizer", required=True)
+    ap.add_argument("--gsm8k_dir", default=None,
+                    help="本地 gsm8k parquet 目录 (绕过 HF 数据集枚举)")
     ap.add_argument("--n_eval", type=int, default=0)     # 0 = 全量测试集
     ap.add_argument("--n_samples", type=int, default=8)  # 每题采样数 (maj@k)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -39,7 +41,10 @@ def main():
     model.load_state_dict(torch.load(args.ckpt, map_location=device)["model"])
     model.eval()
 
-    ds = load_dataset("openai/gsm8k", "main", split="test")
+    if args.gsm8k_dir:
+        ds = load_dataset("parquet", data_files=f"{args.gsm8k_dir}/test.parquet", split="train")
+    else:
+        ds = load_dataset("openai/gsm8k", "main", split="test")
     if args.n_eval:
         ds = ds.select(range(args.n_eval))
     print(f"评测 {len(ds)} 题, 每题采样 {args.n_samples} 次")
