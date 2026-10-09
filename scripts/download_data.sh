@@ -3,6 +3,10 @@
 # 支持断点续传 (-C -), 可重复执行; 用法: bash download_data.sh [起始索引] [数量]
 set -uo pipefail
 
+# 防并发: 两个实例同时 -C - 续传同一 .part 会交错写入导致文件损坏
+exec 9>/tmp/.mini_r1_download.lock
+flock -n 9 || { echo "已有下载实例在跑, 退出"; exit 1; }
+
 PROJ=/root/Test/mini-r1
 RAW=$PROJ/data/raw
 REV=87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
