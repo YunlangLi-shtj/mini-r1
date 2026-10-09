@@ -1,4 +1,25 @@
 .DS_Store
-*.pt
-*.bin
 __pycache__/
+
+# ---- 大文件 / 运行时产物: 只存在于服务器, 永远不进仓库 ----
+# 注意: .gitignore 只在行首认 # 注释, 不能写 "data/  # 说明" —— 那样整行会被
+# 当成一个模式, 规则静默失效。说明一律单独成行。
+#
+# 服务器上的 .git 是同步过去的副本, 少了下面这几条的话, 在那边手滑一次
+# `git add -A` 就会把 66G 数据 + 7G conda 环境加进来。
+
+# 66G: FineWeb-Edu 分片 + 原始 parquet/json + gsm8k
+data/
+# 4.6G+: 模型检查点 + train_log.jsonl
+ckpts/
+# 训练/守护脚本日志
+logs/
+# 7G: conda 环境
+miniforge/
+
+# 检查点
+*.pt
+# token 分片 (data/ 已被整体排除, 这条是双保险)
+*.bin
+*.parquet
+*.part
