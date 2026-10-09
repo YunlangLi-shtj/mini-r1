@@ -136,6 +136,7 @@ scripts/
   watch_pretrain.sh    # ★ 守护：进程被杀自动续训（现锁死单卡，见 §7 第 10 条）
   run_watch.sh         # 把守护脚本拉起来（setsid nohup，单实例保护）
   run_sft.sh / run_grpo.sh / run_eval.sh   # 后续阶段的启动脚本（同样自动选卡）
+  bench_ddp.sh         # 多卡吞吐实测: 等够 N 张干净卡自动跑一次短测（见 §7 第 10 条）
   probe_mem.py         # 显存实测探针（跑一步完整训练，报峰值）
   test_resume_accounting.py   # 断点续训记账的 CPU 冒烟测试（改记账逻辑后必跑）
 ```
@@ -252,7 +253,18 @@ bash scripts/run_eval.sh
     守护脚本的换卡逻辑于是反复"抢到卡 → OOM → 60 秒后重试"，20:36~22:12 一个半小时崩了 103 次，
     进度几乎没动。所以现在 `watch_pretrain.sh` 里 `MAX_GPUS=1` **锁死单卡**。
     想重新启用多卡：先确认 no_sync 生效（`train_pretrain.py` 里已有），**再实测吞吐**，
-    确认真的变快才改回 2；同时把门槛提到 ~13G，否则照样 OOM。
+    确认真的变快才改回 2；同时把门槛提到 ~15G，否则照样 OOM。
+
+    **2026-10-10 补测（未完成）**：3 卡 DDP 第一步 19,467 tok/s（修复前的 2 卡是 3,990），
+    说明 no_sync 确实起作用了；但随即 OOM，因为**多卡每卡要 ~13.2–13.5 GiB，比单卡的 12.0 GiB
+    多 1.5 GiB**（DDP 梯度桶）。所以：
+    - 单卡门槛 13000 MiB **只适用于单卡**，拿去选多卡的卡必然 OOM（就是这么崩的）
+    - 多卡门槛要 **15000 MiB 以上**（详见 `scripts/bench_ddp.sh` 里的 NEED_MB）
+    - 另有一个可省 ~1.6 GiB/卡 的优化没做：`DDP(..., gradient_as_bucket_view=True)`
+      让梯度直接是桶的视图，不再额外持有一份 fp32 梯度。真要认真上多卡时值得加，但要先测。
+
+    另一个坑：**同一台机器上跑第二个 torchrun 必须换端口**，默认 29500 被正在跑的训练占着，
+    不换会 `EADDRINUSE`（bench_ddp.sh 用 29511）。
 
 ---
 
