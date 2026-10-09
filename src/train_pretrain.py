@@ -82,9 +82,12 @@ def main():
     ap.add_argument("--seq_len", type=int, default=2048)
     ap.add_argument("--micro_batch", type=int, default=8)      # 每卡微批次序列数
     ap.add_argument("--grad_accum", type=int, default=8)       # 梯度累积步数
-    ap.add_argument("--peak_lr", type=float, default=1e-3)
-    ap.add_argument("--min_lr", type=float, default=1e-4)
+    # 3e-4 对齐 Pythia-410M (同为 ~0.4B 级别、公开可查的配方)。我们的批更小 (131k vs 2M),
+    # 小批噪声小、能吃更大的 LR, 但共享机器上要连跑几天没人盯着, 取稳不取快。
+    ap.add_argument("--peak_lr", type=float, default=3e-4)
+    ap.add_argument("--min_lr", type=float, default=3e-5)
     ap.add_argument("--warmup_steps", type=int, default=500)
+    ap.add_argument("--decay_frac", type=float, default=0.15)  # WSD 末尾退火占比
     ap.add_argument("--max_steps", type=int, default=0)        # 0 = 跑完整数据集一遍
     ap.add_argument("--max_tokens", type=int, default=0)       # 0 = 跑完整数据集一遍 (优先于此)
     ap.add_argument("--val_every", type=int, default=500)
@@ -96,16 +99,19 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     # ---- 分布式初始化 ----
-    ddp = "RANK" in os.environ
+    # 只有 world>1 才真的上 DDP: 单卡时 DDP 的梯度桶是白白多占一两 GB 显存
+    # (torchrun 即使只起一个进程也会设 RANK, 不能只看 RANK 是否存在)
+    rank = int(os.environ.get("RANK", 0))
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    ddp = world > 1
     if ddp:
-        rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         torch.distributed.init_process_group("nccl")
         device = torch.device(f"cuda:{local_rank}")
-        master = (rank == 0)
     else:
-        rank, world, device, master = 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu"), True
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    master = (rank == 0)
 
     torch.manual_seed(1337 + rank)
 
@@ -147,6 +153,9 @@ def main():
         print(f"起点: {start_tokens:,} tokens ({start_tokens/1e9:.3f}B) | ckpt step {ckpt_step} | "
               f"world={world} | 每步 {tok_per_step:,} tokens")
         print(f"[rank{rank}] 本次计划步数: {n_steps} (全局共 {total_steps})")
+        ds = max(int(total_steps * (1 - args.decay_frac)), start_tokens // ref_tps)
+        print(f"WSD 调度: warmup {args.warmup_steps} 步 -> 恒定 {args.peak_lr:g} "
+              f"-> 第 {ds} 步起退火到 {args.min_lr:g}")
 
     # ---- 训练循环 ----
     logf = open(f"{args.ckpt_dir}/train_log.jsonl", "a")
@@ -156,7 +165,7 @@ def main():
     done = start_tokens
     global_step = start_tokens // ref_tps
     for i in range(n_steps):
-        lr = lr_schedule(global_step, args, total_steps)
+        lr = lr_schedule(global_step, args, total_steps, start_tokens // ref_tps)
         for g in opt.param_groups:
             g["lr"] = lr
         opt.zero_grad(set_to_none=True)
@@ -175,13 +184,15 @@ def main():
             window = min(i + 1, args.log_every)      # 开头不足一个窗口
             loss_avg = running / (window * args.grad_accum)
             tps = tok_per_step * window / (time.time() - t0)
+            peak = torch.cuda.max_memory_allocated() / 2 ** 30 if device.type == "cuda" else 0.0
             print(f"step {global_step:6d}/{total_steps} | {done/1e9:.3f}B tok | "
-                  f"loss {loss_avg:.4f} | lr {lr:.2e} | {tps:,.0f} tok/s", flush=True)
+                  f"loss {loss_avg:.4f} | lr {lr:.2e} | {tps:,.0f} tok/s | {peak:.2f}G",
+                  flush=True)
             logf.write(json.dumps({"step": global_step, "tokens": done, "loss": loss_avg,
                                    "lr": lr, "tok_per_s": tps}) + "\n"); logf.flush()
             running, t0 = 0.0, time.time()
 
-        if i % args.val_every == 0 and master:
+        if i > 0 and i % args.val_every == 0 and master:   # i=0 不做: 刚起步时省一份前向图
             val_loss = evaluate(model, args.data_dir, args.seq_len, device)
             if val_loss is not None:
                 print(f"  >> val loss {val_loss:.4f}", flush=True)
@@ -210,11 +221,21 @@ def save_ckpt(model, opt, ckpt_dir, step, tokens_seen, ddp):
     os.replace(tmp, path)
 
 
-def lr_schedule(step, args, total_steps):
-    """warmup + 余弦退火到 min_lr (step 为与卡数无关的全局步数)。"""
+def lr_schedule(step, args, total_steps, start_step=0):
+    """WSD 调度 (Warmup-Stable-Decay): warmup 后**恒定** LR, 只在末尾退火。
+
+    为什么不用一路余弦: 余弦要求开跑前就把总步数定死, 而共享机器上能跑多久、
+    要不要加练都是未知数。WSD 下任意时刻停下都还能"只跑一段退火尾巴"补出一个
+    收敛的模型, 想延长也不用重新热身 (MiniCPM / DeepSeek 用的就是这个)。
+    decay_start 对 start_step 取 max: 续训时若剩余步数不足退火窗口, 就立刻开始退火,
+    否则会一直停在恒定 LR 上、直到结束都没退火。
+    """
     if step < args.warmup_steps:
         return args.peak_lr * max(step, 1) / args.warmup_steps
-    p = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+    decay_start = max(int(total_steps * (1 - args.decay_frac)), start_step)
+    if step < decay_start:
+        return args.peak_lr
+    p = (step - decay_start) / max(1, total_steps - decay_start)
     return args.min_lr + 0.5 * (args.peak_lr - args.min_lr) * (1 + math.cos(math.pi * min(p, 1.0)))
 
 

@@ -3,15 +3,26 @@
 #             2) 空闲卡变多时自动换更多卡跑 (检查点按绝对 token 记账, 换卡数是安全的)
 # 用法: setsid nohup bash scripts/watch_pretrain.sh >/dev/null 2>&1 &
 cd /root/Test/mini-r1
-# 单实例: 重复启动守护脚本会互相抢卡/互杀 (flock 持有到进程退出)
-exec 9>logs/.watch_pretrain.lock
-flock -n 9 || { echo "已有守护脚本在跑, 退出"; exit 1; }
+# 单实例保护: 重复启动守护脚本会互相抢卡/互杀。
+# 用 pid 文件而不是 flock —— flock 的 fd 会被子进程 (sleep 等) 继承, 杀掉守护后
+# 残留的 sleep 仍然占着锁, 新守护就再也起不来了。
+PIDF=logs/.watch_pretrain.pid
+if [ -f "$PIDF" ]; then
+  OLD=$(cat "$PIDF" 2>/dev/null)
+  if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null \
+     && tr '\0' ' ' < "/proc/$OLD/cmdline" 2>/dev/null | grep -q "watch_pretrain.sh"; then
+    echo "已有守护脚本在跑 (pid $OLD), 退出"; exit 1
+  fi
+fi
+echo $$ > "$PIDF"
+trap 'rm -f "$PIDF"' EXIT
 
 WLOG=logs/pretrain_watch.log
 LOG=logs/pretrain.log
 CKPT=ckpts/pretrain/latest.pt
-MAX_GPUS=4                 # 最多用 4 张, 给同机器的其他人留 2 张
-MIN_FREE_MB=10240          # 单卡空闲显存门槛, 必须与 run_pretrain.sh 里的一致
+MAX_GPUS=2                 # 卡太紧时先保 1-2 张能跑起来; 双卡 DDP 需要每卡 11G+ 空闲
+MIN_FREE_MB=11800          # 单卡空闲显存门槛, 必须与 run_pretrain.sh 里的一致
+                           # 以 nvidia-smi 口径实测占 ~10.8G (probe_mem.py 只报 8.19G, 偏乐观)
 FRESH_SEC=600              # 换卡前等到一个 10 分钟内的检查点, 少丢重跑
 
 free_gpus() {              # 输出空闲卡的 "0,3" 形式

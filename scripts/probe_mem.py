@@ -32,7 +32,9 @@ def try_cfg(micro_batch, seq_len, grad_accum=1):
             (loss / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        peak = torch.cuda.max_memory_allocated() / 2 ** 30
+        # reserved 才是 nvidia-smi 眼里的占用量 (含分配器缓存 + cuda 上下文);
+        # allocated 只是张量本身, 拿它当门槛会低估, 一上机就被别人挤爆
+        peak = torch.cuda.max_memory_reserved() / 2 ** 30
         del model, opt, x, loss
         torch.cuda.empty_cache()
         return peak
@@ -55,8 +57,9 @@ def main():
         if peak is None:
             print(f"  micro_batch {mb:2d}: 显存不够")
         else:
-            print(f"  micro_batch {mb:2d}: 峰值 {peak:5.2f} GiB  "
-                  f"(每步 {mb*args.seq_len*args.grad_accum:,} tokens)")
+            print(f"  micro_batch {mb:2d}: 峰值(含缓存) {peak:5.2f} GiB  "
+                  f"(每步 {mb*args.seq_len*args.grad_accum:,} tokens)  "
+                  f"-> 门槛设 {int(peak * 1024 + 1536)} MiB 较稳")
         if peak is None and mb >= 2:
             break
 

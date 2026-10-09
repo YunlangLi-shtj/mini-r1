@@ -42,13 +42,14 @@ def precompute_rope(max_seq_len: int, head_dim: int, theta: float, device) -> to
 
 
 def chunked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor,
-                          chunk_rows: int = 2048) -> torch.Tensor:
+                          chunk_rows: int = 512) -> torch.Tensor:
     """分块计算交叉熵, 等价于 F.cross_entropy(logits, targets)。
 
     为什么要分块: 词表 152k 时, log_softmax 要在 fp32 下铺一张 (行数 x 词表) 的临时张量。
     micro_batch 4 x seq 2048 = 8192 行 -> 8192*152064*4B ≈ 4.6GB 的**单次分配**,
     比模型本身的 logits 还大一倍, 是 24G 卡上真正撑爆显存的那一项。
-    按 2048 行分块后, 峰值降到 2048*152064*4B ≈ 1.2GB, 数值上完全等价。
+    取 512 行: 单块 512*152064*4B ≈ 0.3GB。共享机器上余量比速度重要 ——
+    2048 行时要 1.2GB, 恰好把"能不能在别人腾出的卡上跑起来"卡在边界上。
     """
     v = logits.size(-1)
     total, count = logits.new_zeros(()), targets.new_zeros(())
