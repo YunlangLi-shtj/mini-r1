@@ -209,9 +209,15 @@ bash scripts/run_eval.sh
 ## 7. 踩过的坑（改数据/训练代码前请先读）
 
 1. **显存门槛必须按 `nvidia-smi` 口径设，不能信 PyTorch 的自报数**
-   `probe_mem.py` 报的 8.19 GiB 是 `max_memory_reserved`；驱动器口径实测要 **~11 GiB**（分配器缓存 + cuBLAS workspace + CUDA 上下文）。
-   按 8.19 设门槛 → 进程被抢占后在"看起来够"的卡上一启动就 OOM，然后**永远起不来**。
-   也不能设太高：本机常年饱和，设狠了就永远选不出卡。现为 **11800 MiB**，`run_pretrain.sh` 和 `watch_pretrain.sh` 里必须保持一致。
+   `probe_mem.py` 报的 8.19 GiB 是 `max_memory_reserved`；`train_log` 里打印的 11.13 G 是 `max_memory_allocated`；
+   **驱动器真正记的是 12,046 MiB**（`nvidia-smi --query-compute-apps=used_memory` 实测）。
+   按 8.19 或 11.13 设门槛 → 进程被抢占后在"看起来够"的卡上一启动就 OOM，然后**永远起不来**。
+   本机常年饱和，门槛也不能设太高，但"选不出卡"只是等 60 秒重试，比 OOM 崩溃循环便宜得多，所以**宁可偏高**。
+   现为 **13000 MiB**，`run_pretrain.sh` 和 `watch_pretrain.sh` 里必须保持一致（status.sh 的标注也用它）。
+   （11800 是 2026-10-09 改掉的旧值：它卡在 12,046 这条线下面，会选中装不下的卡。）
+
+   顺带一提：`max_memory_allocated` 在配置完全相同的情况下历史上报过 8.19 / 9.61 / 11.13 三个值，原因未查明，
+   所以**不要**拿它当门槛依据。真要看占用，用 `nvidia-smi --query-compute-apps=pid,used_memory`。
 
 2. **步数口径要除以 `seq×mb×GA×world`**
    `grad_accum` 随卡数调整，所以 `seq×mb×GA` 本身带卡数因子。拿它当"全局步数"的除数会让 world=2 的日志步数变成 world=1 的两倍。

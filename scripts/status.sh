@@ -69,8 +69,15 @@ echo "── GPU (本机 6 张, 共享机器) ──"
 nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader \
   | awk -F', ' '{
       free = $3 - $2;
-      mark = (free > 11800) ? "  <- 可用 (预训练门槛 11800 MiB)" : "";
+      mark = (free > 13000) ? "  <- 可用 (预训练门槛 13000 MiB)" : "";
       printf "  GPU %s  %6d / %6d MiB  已用%s  空闲 %5d MiB%s\n", $1, $2, $3, $4, free, mark;
     }'
+# 训练在用哪张卡: nvidia-smi 的 compute-apps 报的是**宿主 pid**, 容器里 /proc/<宿主pid>
+# 不存在, 所以没法用 pgrep 的结果去反查; 直接看守护脚本记下的选卡结果最省事。
 echo
-echo "提示: 训练想用更多卡时, 守护脚本会自动等到有卡空出来再重启换卡, 不用手动干预"
+echo "── 训练在用哪张卡 ──"
+sel=$(grep "使用 GPU" logs/pretrain_watch.log 2>/dev/null | tail -1)
+[ -n "$sel" ] && echo "  守护脚本最近一次选卡: ${sel#使用 GPU: }" \
+              || echo "  (日志里还没有选卡记录)"
+echo
+echo "提示: 训练被抢占(别人抢卡导致 OOM)后守护脚本会自动重新选卡续训, 不用手动干预"

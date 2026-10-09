@@ -27,8 +27,10 @@ MAX_GPUS=1                 # ★ 实测多卡更慢, 锁死单卡
                            # 20:36~22:12 一个半小时里崩了 103 次, 几乎没进展。
                            # 换卡逻辑 (#4) 也就此失效: cur=1 时永远不满足 cur < MAX_GPUS。
                            # 想重新启用多卡: 先确认 train_pretrain.py 里 no_sync 生效, 再实测吞吐。
-MIN_FREE_MB=11800          # 单卡空闲显存门槛, 必须与 run_pretrain.sh 里的一致
-                           # 以 nvidia-smi 口径实测占 ~10.8G (probe_mem.py 只报 8.19G, 偏乐观)
+MIN_FREE_MB=13000          # 单卡空闲显存门槛, 必须与 run_pretrain.sh 里的一致
+                           # 以 nvidia-smi 口径实测: 我们的进程记 12,046 MiB
+                           # (训练自报 max_memory_allocated 11.13G, probe_mem.py 只报 8.19G)
+                           # 旧的 11800 卡在这条线下面, 会选到装不下的卡然后 OOM
 FRESH_SEC=600              # 换卡前等到一个 10 分钟内的检查点, 少丢重跑
 
 free_gpus() {              # 输出空闲卡的 "0,3" 形式

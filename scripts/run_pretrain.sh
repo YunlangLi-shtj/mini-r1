@@ -21,13 +21,17 @@ else
   echo "无检查点, 从头开始训练"
 fi
 
-# ---- 挑选空闲 GPU: 空闲显存 > 11.5GB 且利用率 < 80% ----
-# 门槛以「nvidia-smi 口径」为准: probe_mem.py 报的 max_memory_reserved 只有 8.19 GiB,
-# 但真跑起来驱动器记的是 ~10.8 GiB (分配器缓存 + cuBLAS workspace + 上下文都算在内),
-# 按 probe 的数字设门槛会在"看起来够"的卡上一启动就 OOM。
-# 门槛不能设太高: 本机常年饱和, 设狠了就永远选不出卡、进程一死就再也起不来。
+# ---- 挑选空闲 GPU: 空闲显存 > 13GB 且利用率 < 80% ----
+# 门槛以「nvidia-smi 口径」为准, 不能信 PyTorch 的自报数:
+#   probe_mem.py 报 max_memory_reserved 8.19 GiB, 驱动器实记 ~10.8 GiB;
+#   2026-10-09 再实测一次, 训练自己的 max_memory_allocated 是 11.13 GiB,
+#   而 nvidia-smi --query-compute-apps 里我们那个进程记的是 12,046 MiB。
+# 旧的 11800 门槛就卡在这条线下面 —— 会选中 11.8~12.0G 空闲的卡然后一启动就 OOM,
+# 正是 §7 第 1 条那个坑的翻版 (当时就是这么崩了一晚上)。故提到 13000。
+# 门槛不能设太高: 本机常年饱和, 设狠了就永远选不出卡; 但"选不出卡"只是等 60 秒重试,
+# 比 OOM 崩溃循环便宜得多, 所以宁可偏高。
 FREE=$(nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits \
-  | awk -F', ' '$3 - $2 > 11800 && $4 < 80 {printf "%d,", $1}' | sed 's/,$//')
+  | awk -F', ' '$3 - $2 > 13000 && $4 < 80 {printf "%d,", $1}' | sed 's/,$//')
 if [ -z "$FREE" ]; then
   echo "没有空闲 GPU, 当前状态:"; nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
   exit 1
