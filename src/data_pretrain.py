@@ -23,7 +23,7 @@ from tokenizers import Tokenizer
 TOKENS_PER_SHARD = 100_000_000   # 每分片 1 亿 token (uint32, 400MB)
 VAL_DOCS = 10_000                # 末尾文档数用作验证集
 EOT = 2                          # </s>, 文档间分隔符
-NUM_PROC = 8                     # tokenize 子进程数 (共享机器, 克制使用)
+NUM_PROC = 16                    # tokenize 子进程数 (128 核机器, 负载低时可用 16)
 
 
 _TOK_CACHE = {}
