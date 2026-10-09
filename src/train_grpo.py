@@ -110,13 +110,11 @@ def load_gsm8k(tokenizer_path, n_eval=256, gsm8k_dir=None):
         train = load_dataset("openai/gsm8k", "main", split="train")
         test = load_dataset("openai/gsm8k", "main", split="test")
     tok = Tokenizer.from_file(tokenizer_path)
-    prep = lambda batch: {
-        "ids": [tok.encode(PROMPT_TMPL.format(question=q)).ids
-                for q in batch["question"]],
-        "gold": batch["answer"],
-    }
-    train = train.map(prep, batched=True, remove_columns=train.column_names)
-    test = test.select(range(n_eval)).map(prep, batched=True, remove_columns=test.column_names)
+    # 手动构造成 list[dict]: datasets.map 对 ragged list-of-lists 会展平成多行
+    mk = lambda ds: [{"ids": tok.encode(PROMPT_TMPL.format(question=q)).ids, "gold": a}
+                     for q, a in zip(ds["question"], ds["answer"])]
+    train = mk(train)
+    test = mk(test.select(range(min(n_eval, len(test)))))
     return train, test, tok
 
 

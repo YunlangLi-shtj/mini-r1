@@ -42,11 +42,13 @@ def main():
     model.eval()
 
     if args.gsm8k_dir:
-        ds = load_dataset("parquet", data_files=f"{args.gsm8k_dir}/test.parquet", split="train")
+        raw = load_dataset("parquet", data_files=f"{args.gsm8k_dir}/test.parquet", split="train")
     else:
-        ds = load_dataset("openai/gsm8k", "main", split="test")
+        raw = load_dataset("openai/gsm8k", "main", split="test")
     if args.n_eval:
-        ds = ds.select(range(args.n_eval))
+        raw = raw.select(range(min(args.n_eval, len(raw))))
+    # 转成 list[dict] 并用统一的 gold 字段 (parquet 里叫 answer)
+    ds = [{"question": q, "gold": a} for q, a in zip(raw["question"], raw["answer"])]
     print(f"评测 {len(ds)} 题, 每题采样 {args.n_samples} 次")
 
     correct_at_1 = maj_correct = fmt_ok = 0

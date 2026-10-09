@@ -35,7 +35,8 @@ def format_chatml(convs):
 
 
 def build_example(convs, tok, max_len):
-    """返回 (input_ids, labels): 非 assistant 部分 label=-100, 不产生梯度。"""
+    """返回 (input_ids, labels): 非 assistant 部分 label=-100, 不产生梯度。
+    若截断后没有任何 assistant token (labels 全 -100), 返回 None 丢弃该样本。"""
     ids, labels = [], []
     for turn in convs:
         role = turn["from"]
@@ -46,7 +47,23 @@ def build_example(convs, tok, max_len):
         ids.extend(seg)
         labels.extend(seg if is_asst else [-100] * len(seg))
     ids, labels = ids[:max_len], labels[:max_len]
+    if all(l == -100 for l in labels):
+        return None
     return ids, labels
+
+
+class TokenizedSFT(torch.utils.data.Dataset):
+    """已分词的 SFT 样本列表 (避免 datasets.map 对 ragged list-of-lists 的展平问题)。"""
+
+    def __init__(self, examples):
+        self.examples = examples
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        ids, labels = self.examples[i]
+        return {"input_ids": ids, "labels": labels}
 
 
 def collate(examples):
@@ -85,13 +102,16 @@ def main():
     else:
         ds = load_dataset("teknium/OpenHermes-2.5", split="train")
     ds = ds.select(range(min(args.max_samples, len(ds))))
-    print(f"SFT 样本数: {len(ds):,}")
+    # 逐条分词 (tokenizers 是 Rust 实现, 20 万条只需 ~1 分钟)。
+    # 不用 datasets.map: 它会把 ragged 的 list-of-lists 展平成多行。
+    convs = ds["conversations"]
+    examples = [e for e in (build_example(c, tok, args.max_len) for c in convs) if e is not None]
+    dropped = len(convs) - len(examples)
+    print(f"SFT 样本数: {len(examples):,} (丢弃全掩码样本 {dropped})")
+    n_asst = sum(sum(1 for l in labels if l != -100) for _, labels in examples)
+    print(f"assistant token 数: {n_asst:,} (占 {n_asst/sum(len(i) for i,_ in examples):.1%})")
 
-    def prep(batch):
-        outs = [build_example(c, tok, args.max_len) for c in batch["conversations"]]
-        return {"input_ids": [o[0] for o in outs], "labels": [o[1] for o in outs]}
-
-    ds = ds.map(prep, batched=True, batch_size=128, remove_columns=ds.column_names)
+    ds = TokenizedSFT(examples)
     dl = DataLoader(ds, batch_size=args.micro_batch, shuffle=True, num_workers=4,
                     pin_memory=True, collate_fn=collate)
 
