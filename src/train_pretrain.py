@@ -113,13 +113,16 @@ def main():
     model = MiniR1Model(cfg).to(device)
     if args.grad_ckpt:
         # 激活值逐层重算: 显存换时间, 24G 卡跑大微批次的关键
+        # 注意: 必须捕获替换前的绑定方法, 否则 checkpoint 重算时
+        # l(x,cos,sin) 会经 __call__ 再进入被替换的 fwd -> 无限递归
         from torch.utils.checkpoint import checkpoint
         for layer in model.layers:
-            def make_forward(l):
+            orig = layer.forward
+            def make_forward(orig_forward):
                 def fwd(x, cos, sin, mask=None):
-                    return checkpoint(l, x, cos, sin, mask, use_reentrant=False)
+                    return checkpoint(orig_forward, x, cos, sin, mask, use_reentrant=False)
                 return fwd
-            layer.forward = make_forward(layer)
+            layer.forward = make_forward(orig)
     if master:
         print(f"模型参数量: {model.num_params/1e6:.1f}M | DDP={ddp} world={world} | grad_ckpt={args.grad_ckpt}")
     if ddp:
@@ -164,7 +167,8 @@ def main():
         opt.step()
 
         if step % args.log_every == 0 and master:
-            loss_avg = running / (args.log_every * args.grad_accum)
+            n_loss = min(step + 1, args.log_every) * args.grad_accum  # 开头不足一个窗口
+            loss_avg = running / n_loss
             tps = args.seq_len * args.micro_batch * args.grad_accum * world * args.log_every / (time.time() - t0)
             print(f"step {step:6d}/{max_steps} | loss {loss_avg:.4f} | lr {lr:.2e} | {tps:,.0f} tok/s", flush=True)
             logf.write(json.dumps({"step": step, "loss": loss_avg, "lr": lr}) + "\n"); logf.flush()
@@ -196,10 +200,10 @@ def evaluate(model, data_dir, seq_len, device, n_batches=20):
     val = np.memmap(f"{data_dir}/val.bin", dtype=np.uint32, mode="r")
     model.eval()
     losses = []
-    n_batches = min(n_batches, val.size // (seq_len * 2 + 1))
+    n_batches = min(n_batches, val.size // (seq_len + 1))
     for i in range(n_batches):
-        start = i * seq_len * 2
-        chunk = torch.from_numpy(val[start:start + seq_len * 2 + 1].astype(np.int64)).to(device)
+        start = i * seq_len
+        chunk = torch.from_numpy(val[start:start + seq_len + 1].astype(np.int64)).to(device)
         x, y = chunk[:-1][None, :], chunk[1:][None, :]
         with torch.autocast("cuda", torch.bfloat16):
             loss, _ = model(x, y)
