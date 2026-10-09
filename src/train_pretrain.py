@@ -24,17 +24,23 @@ from model import MiniR1Model, ModelConfig
 # ---------------- 数据: memmap 分片顺序流 ----------------
 
 class ShardLoader:
-    """顺序读取二进制分片, 按 rank 错开起点 (每 rank 读全量数据, 顺序不同)。"""
+    """顺序读取二进制分片, 按 rank 错开起点 (每 rank 读全量数据, 顺序不同)。
 
-    def __init__(self, data_dir, seq_len, rank, world_size):
+    start_pos: 跳过开头 N 个 token (断点续训时从断点数据继续)。
+    """
+
+    def __init__(self, data_dir, seq_len, rank, world_size, start_pos=0):
         files = sorted(f"{data_dir}/train/shard_{i:05d}.bin"
                        for i in range(sum(1 for f in os.listdir(f"{data_dir}/train"))))
         self.maps = [np.memmap(f, dtype=np.uint32, mode="r") for f in files]
-        self.seq_len, self.rank, self.world_size = seq_len, rank, world_size
-        self.shard, self.pos = 0, 0
-        # 初始错开: 第 rank 从第 rank 个分片开始
-        self.shard = rank % len(self.maps)
+        self.seq_len = seq_len
         self.n_tokens = sum(m.size for m in self.maps)
+        # 初始错开: 第 rank 从第 rank 个分片开始, 并跳过已训数据 (可跨多个分片)
+        self.shard = rank % len(self.maps)
+        self.pos = start_pos
+        while self.pos >= self.maps[self.shard].size:
+            self.pos -= self.maps[self.shard].size
+            self.shard = (self.shard + 1) % len(self.maps)
 
     def next_batch(self, batch_size, device):
         """返回 (x, y) 各 (B, T), 不足一个分片末尾时跨分片续读。"""
@@ -128,8 +134,10 @@ def main():
         opt.load_state_dict(ckpt["opt"])
         step0 = ckpt["step"]
 
-    # ---- 数据 ----
-    loader = ShardLoader(args.data_dir, args.seq_len, rank, world)
+    # ---- 数据 (续训时跳过已训 token) ----
+    tok_per_step = args.seq_len * args.micro_batch * args.grad_accum * world
+    loader = ShardLoader(args.data_dir, args.seq_len, rank, world,
+                         start_pos=step0 * tok_per_step)
     if master:
         print(f"数据总量: {loader.n_tokens/1e9:.2f}B tokens")
     max_steps = args.max_steps or max(1, loader.n_tokens // (args.seq_len * args.micro_batch * args.grad_accum * world))
