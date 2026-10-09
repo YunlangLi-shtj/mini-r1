@@ -56,6 +56,36 @@ def test_loader_offset():
     print("  [1] ShardLoader 起点偏移正确 (含跨分片)")
 
 
+def test_step_units():
+    """步数口径必须与卡数无关。
+
+    grad_accum 会随卡数调整 (卡多了就降 GA, 保持全局批 ≈131k 不变), 所以
+    「每卡每步 token」= seq*mb*GA 本身是随卡数变的; 只有再乘上 world 才是真正的
+    一步优化器消耗的 token。这里直接盯住三个 world 下的 total_steps 与退火起点,
+    防止再出现「world=2 的日志步数是 world=1 的两倍」这类口径漂移。
+    """
+    sys.path.insert(0, f"{PROJ}/src")
+    from train_pretrain import plan_progress, decay_start
+    TARGET = 5_000_000_000
+    ref = None
+    for world, ga in ((1, 64), (2, 32), (4, 16)):
+        tps = 2048 * 1 * ga * world          # 三种卡数下都应是 131072
+        total, _ = plan_progress(TARGET, 0, tps)
+        ds = decay_start(total, 0, tps, 0.15)
+        if ref is None:
+            ref = (tps, total, ds)
+        assert (tps, total, ds) == ref, f"world={world}: {(tps, total, ds)} != {ref}"
+    assert ref == (131072, 38146, 32424), f"5B 目标的步数口径不对: {ref}"
+    print(f"  [0] 步数口径与卡数无关: world=1/2/4 均为 {ref[1]} 步, 第 {ref[2]} 步起退火 ✓")
+
+    # 提前收尾: 已跑 3.0B 时把目标改成 3.3B, 退火应立刻从当前进度开始 (而不是等 85% 处)
+    tps = 131072
+    total, _ = plan_progress(3_300_000_000, 3_000_000_000, tps)
+    ds = decay_start(total, 3_000_000_000, tps, 0.15)
+    assert ds == 3_000_000_000 // tps, f"提前收尾的退火起点应在当前进度, 实际第 {ds} 步"
+    print(f"  [0b] 提前收尾: 3.0B 处改目标 3.3B -> 立即退火, 共 {total} 步 ✓")
+
+
 def run_train(extra):
     # CUDA_VISIBLE_DEVICES="" 强制走 CPU: 共享机器上 GPU 常年被占满, 这个测试不该去抢卡
     return sh(f"cd {PROJ} && CUDA_VISIBLE_DEVICES='' {PY} -u src/train_pretrain.py "
@@ -66,6 +96,7 @@ def run_train(extra):
 
 def main():
     make_data()
+    test_step_units()
     test_loader_offset()
 
     # ---- 阶段 A: 跑 4 步 (512 token), 应写出 tokens_seen=512 ----

@@ -133,27 +133,30 @@ def main():
     # world (卡数) 是每步 token 量的因子。共享机器上守护脚本每次重启用几张卡是随机的,
     # 若按 step*tok_per_step 推算数据偏移, 换卡后续训会跳到错误位置 (漏读/重读大量数据),
     # 所以检查点里存绝对的 tokens_seen; LR 调度也用 token 换算出的「全局步数」, 保证与卡数无关。
-    ref_tps = args.seq_len * args.micro_batch * args.grad_accum      # world=1 时每步 token
-    tok_per_step = ref_tps * world
+    #
+    # 注意 grad_accum 是随卡数调整的 (卡多了就降 GA), 所以「每卡每步 token」= 131072/world,
+    # 只有乘上 world 才是真正的一步优化器所消耗的 token。步数一律用 tok_per_step 换算,
+    # 否则 world=2 时步数会翻倍、和 world=1 的日志没法比。
+    per_gpu_tps = args.seq_len * args.micro_batch * args.grad_accum
+    tok_per_step = per_gpu_tps * world
     start_tokens, ckpt_step = 0, 0
     if args.resume:
         ckpt = torch.load(f"{args.ckpt_dir}/latest.pt", map_location=device)
         (model.module if ddp else model).load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         ckpt_step = ckpt.get("step", 0)
-        start_tokens = ckpt.get("tokens_seen", ckpt_step * ref_tps)   # 兼容旧检查点
+        start_tokens = ckpt.get("tokens_seen", ckpt_step * tok_per_step)   # 兼容旧检查点
 
     # ---- 数据 (续训时跳过已训 token) ----
     loader = ShardLoader(args.data_dir, args.seq_len, rank, world, start_pos=start_tokens)
-    target_tokens = args.max_tokens or (args.max_steps * ref_tps if args.max_steps else loader.n_tokens)
-    total_steps = max(1, target_tokens // ref_tps)                   # 全局步数 (LR 调度用)
-    n_steps = max(0, (target_tokens - start_tokens) // tok_per_step)  # 本次进程要跑的步数
+    target_tokens = args.max_tokens or (args.max_steps * tok_per_step if args.max_steps else loader.n_tokens)
+    total_steps, n_steps = plan_progress(target_tokens, start_tokens, tok_per_step)
+    ds = decay_start(total_steps, start_tokens, tok_per_step, args.decay_frac)
     if master:
         print(f"数据总量: {loader.n_tokens/1e9:.2f}B tokens | 目标: {target_tokens/1e9:.2f}B tokens")
         print(f"起点: {start_tokens:,} tokens ({start_tokens/1e9:.3f}B) | ckpt step {ckpt_step} | "
               f"world={world} | 每步 {tok_per_step:,} tokens")
         print(f"[rank{rank}] 本次计划步数: {n_steps} (全局共 {total_steps})")
-        ds = max(int(total_steps * (1 - args.decay_frac)), start_tokens // ref_tps)
         print(f"WSD 调度: warmup {args.warmup_steps} 步 -> 恒定 {args.peak_lr:g} "
               f"-> 第 {ds} 步起退火到 {args.min_lr:g}")
 
@@ -163,9 +166,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     model.train()
     done = start_tokens
-    global_step = start_tokens // ref_tps
+    global_step = start_tokens // tok_per_step
     for i in range(n_steps):
-        lr = lr_schedule(global_step, args, total_steps, start_tokens // ref_tps)
+        lr = lr_schedule(global_step, args, total_steps, ds)
         for g in opt.param_groups:
             g["lr"] = lr
         opt.zero_grad(set_to_none=True)
@@ -178,7 +181,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         done = start_tokens + (i + 1) * tok_per_step
-        global_step = done // ref_tps
+        global_step = done // tok_per_step
 
         if i % args.log_every == 0 and master:
             window = min(i + 1, args.log_every)      # 开头不足一个窗口
@@ -209,6 +212,21 @@ def main():
     print(f"[rank{rank}] 训练完成")
 
 
+def plan_progress(target_tokens, start_tokens, tok_per_step):
+    """把「目标/已训 token」换算成步数。抽成纯函数是为了能在 CPU 上验证:
+    换卡数时 grad_accum 跟着变, 只有 tok_per_step = seq*mb*GA*world 才守恒,
+    步数口径必须由它算出来, 否则 world=2 的日志步数会是 world=1 的两倍。"""
+    total_steps = max(1, target_tokens // tok_per_step)
+    n_steps = max(0, (target_tokens - start_tokens) // tok_per_step)
+    return total_steps, n_steps
+
+
+def decay_start(total_steps, start_tokens, tok_per_step, decay_frac):
+    """WSD 退火起点。对续训起点取 max: 剩余步数不足退火窗口时立刻开始退火,
+    否则会一直停在恒定 LR 上、直到训练结束都没退火。"""
+    return max(int(total_steps * (1 - decay_frac)), start_tokens // tok_per_step)
+
+
 def save_ckpt(model, opt, ckpt_dir, step, tokens_seen, ddp):
     """原子写检查点: 先写 .tmp 再 os.replace。
     共享机器上训练随时可能被杀, 直接覆盖 latest.pt 若中途被杀会留下损坏文件,
@@ -221,21 +239,19 @@ def save_ckpt(model, opt, ckpt_dir, step, tokens_seen, ddp):
     os.replace(tmp, path)
 
 
-def lr_schedule(step, args, total_steps, start_step=0):
+def lr_schedule(step, args, total_steps, ds):
     """WSD 调度 (Warmup-Stable-Decay): warmup 后**恒定** LR, 只在末尾退火。
 
     为什么不用一路余弦: 余弦要求开跑前就把总步数定死, 而共享机器上能跑多久、
     要不要加练都是未知数。WSD 下任意时刻停下都还能"只跑一段退火尾巴"补出一个
     收敛的模型, 想延长也不用重新热身 (MiniCPM / DeepSeek 用的就是这个)。
-    decay_start 对 start_step 取 max: 续训时若剩余步数不足退火窗口, 就立刻开始退火,
-    否则会一直停在恒定 LR 上、直到结束都没退火。
+    ds (退火起点) 由 decay_start() 单独算好传进来。
     """
     if step < args.warmup_steps:
         return args.peak_lr * max(step, 1) / args.warmup_steps
-    decay_start = max(int(total_steps * (1 - args.decay_frac)), start_step)
-    if step < decay_start:
+    if step < ds:
         return args.peak_lr
-    p = (step - decay_start) / max(1, total_steps - decay_start)
+    p = (step - ds) / max(1, total_steps - ds)
     return args.min_lr + 0.5 * (args.peak_lr - args.min_lr) * (1 + math.cos(math.pi * min(p, 1.0)))
 
 

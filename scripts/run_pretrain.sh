@@ -3,10 +3,10 @@
 # 用法: bash run_pretrain.sh [n_gpus]   (n_gpus 默认 3, 上限见空闲卡数)
 # 需在服务器上运行, 依赖 conda 环境 mini-r1
 #
-# 想提前收尾 (不用等全量 9.9B): 把检查点已有的 token 数 + 一段退火尾巴 (约 10%)
+# 想提前收尾 (不用跑满 5B): 把检查点已有的 token 数 + 一段退火尾巴 (约 10%)
 # 传给 --max_tokens 重启即可, 例如已经跑了 3.0B 就改成 --max_tokens 3300000000,
 # WSD 调度会从当前进度立刻开始退火 —— 这样停下来的是个收敛好的模型, 而不是半成品。
-# 想加练: 直接 --max_tokens 0 继续跑, LR 会回到恒定段, 不用重新热身。
+# 想加练: 直接改成 --max_tokens 0 (跑满 9.9B) 继续跑, LR 会回到恒定段, 不用重新热身。
 set -euo pipefail
 
 PROJ=/root/Test/mini-r1
@@ -53,6 +53,7 @@ setsid nohup $PROJ/miniforge/envs/mini-r1/bin/torchrun --nproc_per_node=$NGPU \
   --data_dir $PROJ/data --ckpt_dir $PROJ/ckpts/pretrain \
   --micro_batch 1 --grad_accum $GA --seq_len 2048 \
   --peak_lr 3e-4 --min_lr 3e-5 --warmup_steps 500 \
+  --max_tokens 5000000000 \
   --val_every 200 --ckpt_every 200 $RESUME \
   >> $PROJ/logs/pretrain.log 2>&1 < /dev/null &
 echo "预训练已启动, 日志: $PROJ/logs/pretrain.log"
