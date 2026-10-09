@@ -39,8 +39,10 @@ def build_example(convs, tok, max_len):
     ids, labels = [], []
     for turn in convs:
         role = turn["from"]
-        seg = tok.encode(f"<|im_start|>{role}\n{turn['value']}<|im_end|>\n").ids
+        # OpenHermes 用 "human"/"gpt", 映射到 ChatML 标准角色名
+        role = "user" if role == "human" else ("assistant" if role == "gpt" else role)
         is_asst = role == "assistant"
+        seg = tok.encode(f"<|im_start|>{role}\n{turn['value']}<|im_end|>\n").ids
         ids.extend(seg)
         labels.extend(seg if is_asst else [-100] * len(seg))
     ids, labels = ids[:max_len], labels[:max_len]
