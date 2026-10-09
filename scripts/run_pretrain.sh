@@ -8,6 +8,11 @@ PROJ=/root/Test/mini-r1
 N_GPUS="${2:-3}"
 RESUME=""
 [ "${1:-}" = "--resume" ] && RESUME="--resume"
+# 已有检查点就自动续训 (共享机器上任务会被反复打断, 误从零开始会白跑几十小时)
+if [ -z "$RESUME" ] && [ -f "$PROJ/ckpts/pretrain/latest.pt" ]; then
+  echo "检测到已有 latest.pt, 自动改用 --resume (要重训请先手动删除该文件)"
+  RESUME="--resume"
+fi
 
 # ---- 挑选空闲 GPU: 空闲显存 > 10GB 且利用率 < 80% (微批次 4 约需 7-9GB) ----
 FREE=$(nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits \
@@ -31,6 +36,6 @@ setsid nohup $PROJ/miniforge/envs/mini-r1/bin/torchrun --nproc_per_node=$NGPU \
   --data_dir $PROJ/data --ckpt_dir $PROJ/ckpts/pretrain \
   --micro_batch 4 --grad_accum 16 --seq_len 2048 \
   --peak_lr 1e-3 --min_lr 1e-4 --warmup_steps 500 \
-  --val_every 500 --ckpt_every 1000 $RESUME \
+  --val_every 500 --ckpt_every 500 $RESUME \
   > $PROJ/logs/pretrain.log 2>&1 < /dev/null &
 echo "预训练已启动, 日志: $PROJ/logs/pretrain.log"

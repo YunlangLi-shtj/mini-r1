@@ -180,10 +180,24 @@ def main():
             logf.write(json.dumps({"step": step, "val_loss": val_loss}) + "\n"); logf.flush()
 
         if step % args.ckpt_every == 0 and step > 0 and master:
-            torch.save({"step": step, "model": (model.module if ddp else model).state_dict(),
-                        "opt": opt.state_dict()}, f"{args.ckpt_dir}/latest.pt")
-            print(f"  >> checkpoint saved @ step {step}")
+            save_ckpt(model, opt, args.ckpt_dir, step, ddp, device)
+            print(f"  >> checkpoint saved @ step {step}", flush=True)
+    if master:
+        # 收尾保存: max_steps 不是 ckpt_every 整数倍时, 否则最后一个检查点偏旧
+        save_ckpt(model, opt, args.ckpt_dir, max_steps, ddp, device)
+        print(f"  >> 最终 checkpoint saved @ step {max_steps}", flush=True)
     print(f"[rank{rank}] 训练完成")
+
+
+def save_ckpt(model, opt, ckpt_dir, step, ddp, device):
+    """原子写检查点: 先写 .tmp 再 os.replace。
+    共享机器上训练随时可能被杀, 直接覆盖 latest.pt 若中途被杀会留下损坏文件,
+    下次 --resume 就再也起不来了。"""
+    path = f"{ckpt_dir}/latest.pt"
+    tmp = f"{path}.tmp"
+    torch.save({"step": step, "model": (model.module if ddp else model).state_dict(),
+                "opt": opt.state_dict()}, tmp)
+    os.replace(tmp, path)
 
 
 def lr_schedule(step, args):
