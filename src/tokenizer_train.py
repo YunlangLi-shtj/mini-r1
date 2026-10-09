@@ -31,8 +31,7 @@ def main():
 
     # 1. 流式读取前 N 个分片, 只取 text 列 (streaming 模式不落盘)
     print(f"[1/3] 流式读取 {args.dataset} 前 {args.num_shards} 个分片 ...")
-    ds = load_dataset(args.dataset, split="train", streaming=True,
-                      trust_remote_code=True)
+    ds = load_dataset(args.dataset, split="train", streaming=True)
 
     def text_gen():
         total = 0
