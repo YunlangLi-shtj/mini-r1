@@ -148,6 +148,18 @@ class MiniR1Model(nn.Module):
                                    cfg.rope_theta, device="cpu")
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """GPT-2 风格初始化: 所有线性层/嵌入 N(0, 0.02), RMSNorm 权重为 1。
+
+        比 PyTorch 默认 (Embedding N(0,1)) 收敛更快: 初始 loss 直接 ≈ ln(vocab) ≈ 11.9,
+        避免前几百步的高 loss 平台期。
+        """
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         """idx: (B, T) 长整型 token id。若给 targets 则返回 (loss, logits), 否则只返回 logits。"""
