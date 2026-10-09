@@ -20,22 +20,22 @@ trap 'rm -f "$PIDF"' EXIT
 WLOG=logs/pretrain_watch.log
 LOG=logs/pretrain.log
 CKPT=ckpts/pretrain/latest.pt
-MAX_GPUS=1                 # ★ 实测多卡更慢, 锁死单卡
-                           # 2026-10-09 实测: 单卡 16,000 tok/s; 双卡 DDP 只有 4,000 tok/s
-                           # (梯度累积没关同步 + 卡还被别人共占, 通信把算力吃光了),
-                           # 而且双卡要每卡 12.6G, 在满负荷的机器上反复 OOM ——
-                           # 20:36~22:12 一个半小时里崩了 103 次, 几乎没进展。
-                           # 换卡逻辑 (#4) 也就此失效: cur=1 时永远不满足 cur < MAX_GPUS。
-                           # 想重新启用多卡: 先确认 train_pretrain.py 里 no_sync 生效, 再实测吞吐。
-MIN_FREE_MB=13000          # 单卡空闲显存门槛, 必须与 run_pretrain.sh 里的一致
-                           # 以 nvidia-smi 口径实测: 我们的进程记 12,046 MiB
+MAX_GPUS=2                 # 2026-10-10 实测 (修复 no_sync 之后):
+                           #   单卡 16,630 | 2 卡 29,389 (1.77x, 每卡 88%)
+                           #   3 卡 33,260 (2.00x, 每卡 67%)
+                           # 第 3 张卡只多 13% 吞吐却多占一整张卡, 很不划算, 所以上限 2。
+                           # 历史: 2026-10-09 多卡慢 4 倍是梯度累积漏了 no_sync(),
+                           # 已修; 但共享机器上多卡仍然更脆 —— 一张卡被抢就整个崩掉重启,
+                           # 所以 run_pretrain.sh 是"凑不齐 2 张全空的卡就自动退回单卡"。
+MIN_FREE_MB=13000          # 单卡门槛 (run_pretrain.sh 负责实际选卡, 这里只为换卡判断)
+                           # 以 nvidia-smi 口径: 我们进程记 12,046 MiB
                            # (训练自报 max_memory_allocated 11.13G, probe_mem.py 只报 8.19G)
-                           # 旧的 11800 卡在这条线下面, 会选到装不下的卡然后 OOM
+MULTI_FREE_MB=15000        # 多卡每卡门槛: DDP 的梯度桶多占 1.5 GiB, 单卡门槛会 OOM
 FRESH_SEC=600              # 换卡前等到一个 10 分钟内的检查点, 少丢重跑
 
-free_gpus() {              # 输出空闲卡的 "0,3" 形式
+free_gpus() {              # $1=显存门槛 $2=利用率上限; 输出空闲卡的 "0,3" 形式
   nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits \
-    | awk -F', ' -v m="$MIN_FREE_MB" '$3 - $2 > m && $4 < 80 {printf "%d,", $1}' | sed 's/,$//'
+    | awk -F', ' -v m="$1" -v u="$2" '$3 - $2 > m && $4 < u {printf "%d,", $1}' | sed 's/,$//'
 }
 n_of() { [ -z "$1" ] && echo 0 || echo "$1" | tr ',' '\n' | wc -l; }
 running() { pgrep -f "[t]rain_pretrain.py" > /dev/null; }
@@ -70,8 +70,10 @@ while true; do
   done
 
   # ---- 在跑: 空闲卡明显变多就换更多卡 (cur+N >= 1.5*cur, 小提升不折腾) ----
+  # 用多卡门槛判断: 我们要的是"能再加一张卡", 那这张卡必须满足多卡的显存要求,
+  # 拿单卡门槛算会把只能跑单卡的卡也算进来, 切过去就 OOM。
   if running && [ "$cur" -lt "$MAX_GPUS" ]; then
-    F=$(free_gpus); N=$(n_of "$F")
+    F=$(free_gpus "$MULTI_FREE_MB" 20); N=$(n_of "$F")
     if [ "$N" -gt 0 ] && [ $(( (cur + N) * 2 )) -ge $(( cur * 3 )) ]; then
       use=$(( cur + N > MAX_GPUS ? MAX_GPUS : cur + N ))
       log "空闲卡变多 ($cur -> 计划 $use), 等一个较新的检查点后换卡"
