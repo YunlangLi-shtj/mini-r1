@@ -14,7 +14,7 @@
 
 ## 1. 现在到哪一步了
 
-_最后更新: 2026-10-09 23:00_
+_最后更新: 2026-10-12 14:30_
 
 | 阶段 | 状态 | 产物 / 说明 |
 |---|---|---|
@@ -22,8 +22,8 @@ _最后更新: 2026-10-09 23:00_
 | 代码编写 | ✅ 完成 | `src/` 全部模块，见 §4 |
 | 分词器 | ✅ 完成 | byte-level BPE，vocab 152,064（与 Qwen2 同规模） |
 | 数据管线 | ✅ 完成 | 100 个分片，**9.903B train + 0.010B val tokens**，66 GB |
-| **预训练** | 🔄 **进行中** | 跑到 step 1601 / 38146（0.210B / 5B tokens），loss 12.15 → 4.29 |
-| SFT | ⏸ 未开始 | 数据已就绪，脚本已就绪 |
+| **预训练** | ✅ **完成** | **4.999B tokens / step 38141，最终 val_loss 3.1296**，46 小时零重启 |
+| **SFT** | 🔄 **进行中** | 6,240 步（20 万条 OpenHermes，1 epoch）；loss 2.24 → 1.55 |
 | GRPO | ⏸ 未开始 | 数据已就绪，**但需先加 KV-Cache**（见 §8） |
 | 评测 / 消融 | ⏸ 未开始 | — |
 | README 实验数据 | ⏸ 未开始 | 等评测结果 |
@@ -31,8 +31,9 @@ _最后更新: 2026-10-09 23:00_
 **当前训练的实时快照**（用 §2 的命令可以自己看）：
 
 ```
-step   1601/38146 | 0.210B tok | loss 4.3017 | lr 3.00e-04 | 15,409 tok/s | 11.13G
-val_loss @step 1601 = 4.35     检查点 latest.pt 4.6G     剩余 ≈ 3.2 天 (单卡)
+预训练: 已完成 —— ckpts/pretrain/latest.pt 4.6G, step 38141, val_loss 3.1296
+SFT   : 跑到 step 900/6240 | loss 1.5484 | 0.12s/micro | 10.08G (单卡, mb1+grad_ckpt)
+        续训检查点 ckpts/sft/sft_latest.pt, 每 100 步原子写一次
 ```
 
 > 多卡已修复并实测（见 §7 第 10 条）：**2 卡 1.77×，3 卡 2.00×**，上限设为 2 卡。
@@ -137,7 +138,9 @@ scripts/
   run_pretrain.sh      # 选空闲卡 + 拼参数 + 启动预训练（有检查点自动 --resume）
   watch_pretrain.sh    # ★ 守护：进程被杀自动续训（现锁死单卡，见 §7 第 10 条）
   run_watch.sh         # 把守护脚本拉起来（setsid nohup，单实例保护）
-  run_sft.sh / run_grpo.sh / run_eval.sh   # 后续阶段的启动脚本（同样自动选卡）
+  run_sft.sh           # SFT 启动: 等空闲卡 (最多 30 分钟) + 有检查点自动续训
+  watch_sft.sh         # SFT 守护: 被抢占/OOM 后自动续训, 训完自己退出
+  run_grpo.sh / run_eval.sh   # 后续阶段的启动脚本（同样自动选卡）
   bench_ddp.sh         # 多卡吞吐实测: 等够 N 张干净卡自动跑一次短测（见 §7 第 10 条）
   probe_mem.py         # 显存实测探针（跑一步完整训练，报峰值）
   test_resume_accounting.py   # 断点续训记账的 CPU 冒烟测试（改记账逻辑后必跑）
@@ -167,11 +170,18 @@ bash scripts/run_watch.sh                # 拉起守护（单实例保护，重�
 ### 5.2 SFT
 
 ```bash
-bash scripts/run_sft.sh
+bash scripts/run_sft.sh          # 有 ckpts/sft/sft_latest.pt 会自动续训, 不用加参数
+bash scripts/watch_sft.sh        # 可选: 守护 (被抢占/OOM 后自动续训)
 ```
 
 数据：`data/raw/openhermes/openhermes2_5.json`（OpenHermes-2.5，1.9 GB，取 20 万条）。
-产物：`ckpts/sft/`。**依赖预训练检查点**，所以要等预训练跑完（或至少跑出可用的 base 模型）。
+产物：`ckpts/sft/sft.pt`（最终权重）；`ckpts/sft/sft_latest.pt`（含 optimizer 的续训检查点，每 100 步原子写）。
+**依赖预训练检查点**，所以要等预训练跑完（或至少跑出可用的 base 模型）。
+
+⚠️ **续训只认 `seed + micro_batch + grad_accum` 完全一致的组合**：续训的实现是
+「固定 seed 重现 shuffle 顺序 → 空转跳过已消费的前 N 个 micro-batch」，
+换了这三个里的任何一个，跳过的就是另一批数据，等于在错误的样本位置上接着训。
+要改档位就得删掉 `sft_latest.pt` 从头跑。
 
 ### 5.3 GRPO
 
@@ -288,6 +298,36 @@ bash scripts/run_eval.sh
     `division by 0`，`set -e` 直接让启动脚本退出、训练没起来。
     用 `grep -c '[0-9]'` 代替 `wc -l`（grep 会处理没有结尾换行的最后一行）。
     教训：**纯函数要单独测**，别只在"正常输入"上跑一次就算过。
+
+12. **SFT 一开始没有断点续训，差点被一次关机全抹掉**（2026-10-12）
+    原 `train_sft.py` 只在 `for` 循环**跑完之后**才 `torch.save` 一次。所以 6.6 小时的
+    训练只要中途被打断（共享机器抢卡、机器重启、容器回收），进度就归零。
+    那天下午服务器要装硬盘关机，跑到 step 900 才发现这个问题——**跑得越久，这个坑越贵**。
+    补上的东西（照搬预训练那套已踩过坑的做法）：
+    - **原子写**：先写 `sft_latest.pt.tmp` 再 `os.replace`。抢在覆盖文件的瞬间被杀，
+      留下半个文件就再也 resume 不起来了（预训练踩过，见第 7 条）。
+    - **存的东西要够续训**：`model + optimizer + step + 已消费的 micro-batch 数`。
+      只存权重的话 AdamW 的一二阶动量丢了，续训头几百步会抖。
+    - **种子固定**：`DataLoader(generator=torch.Generator().manual_seed(seed))`。
+      不给 generator 时 PyTorch 用全局随机源，**每次重启 shuffle 顺序都不一样**，
+      "跳过前 N 个 micro-batch"就跳到了另一批数据上——这种 bug 不报错，
+      只表现为 loss 曲线有个说不清的毛刺。
+    - **存检查点要记 micro 而不是只记 step**：`micro` 是 micro-batch 计数，
+      跳过时要跳过的是它；只在优化器步边界存，保证它是 `grad_accum` 的整数倍。
+    - **结束时也存一次**：收尾那些不满 `ckpt_every` 的零头步数如果不进检查点，
+      重启后会白跑一遍。
+    代价：4.9 GB × 每 100 步。100 步 ≈ 7 分钟，写盘约半分钟，**约 7% 的墙钟开销**。
+    这个买卖在任何会被打断的任务上都很划算。
+
+    **续训的 off-by-one（最阴的一个）**：跳过循环写的是 `if micro < start_micro: continue`，
+    而 `micro` 的初值如果也写成 `start_micro`，条件当场为假——**一个 micro-batch 都不会跳过**，
+    优化器从第 32 步的状态接着，数据却从头读起，等于把前面见过的样本又学一遍。
+    症状是续训后的 loss **比不中断更低**（实测 step40：A=2.8216 vs B=2.3211，低 18%），
+    因为那批数据它已经见过了。不报任何异常，只表现为 loss 曲线莫名偏低。
+    修法：`micro` 从 **0** 起，让它老老实实数到 `start_micro`；`step` 仍从 `start_step` 起（LR 要用）。
+    教训：**续训路径必须在没出事的时候先跑一遍**（`scripts/test_sft_resume.sh`），
+    而且要让它自己判定通过/不通过——靠人眼看两列 loss 数字，这种"低了 0.5"很容易被
+    当成"续训后收敛更好"而放过去。
 
 ---
 
