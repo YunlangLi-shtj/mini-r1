@@ -103,7 +103,8 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.d_model, cfg.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(cfg.n_heads * self.head_dim, cfg.d_model, bias=False)
 
-    def forward(self, x, cos, sin, mask=None):
+    def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False,
+                is_causal=None):
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
@@ -113,15 +114,27 @@ class Attention(nn.Module):
         q = apply_rope(q, cos, sin).transpose(1, 2)          # (B, n_heads, T, d)
         k = apply_rope(k, cos, sin).transpose(1, 2)          # (B, n_kv_heads, T, d)
         v = v.transpose(1, 2)
+        present = None
+        if use_cache:
+            if past_kv is not None:                          # 把历史 KV 接到前面
+                k = torch.cat([past_kv[0], k], dim=2)         # 沿 seq 维拼
+                v = torch.cat([past_kv[1], v], dim=2)
+            # ★ 缓存的是**未复制**的 KV: 存 n_kv_heads 份而不是 n_heads 份, 显存直接减半。
+            #   repeat_interleave 放到使用前做 —— 每步都要复制一遍, 但那是临时的, 不驻留。
+            present = (k, v)
         # GQA: KV 头沿组维复制
         k = k.repeat_interleave(self.n_rep, dim=1)
         v = v.repeat_interleave(self.n_rep, dim=1)
-        # SDPA: 若装了 flash-attn, PyTorch 自动走 flash 内核; 否则退化为内存高效内核
+        # SDPA: 若装了 flash-attn, PyTorch 自动走 flash 内核; 否则退化为内存高效内核。
+        # is_causal 由调用方决定 (带缓存时**不能**用, 见 MiniR1Model.forward 里的说明)。
+        if is_causal is None:
+            is_causal = mask is None
         y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=(mask is None)
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=is_causal
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.o_proj(y)
+        out = self.o_proj(y)
+        return (out, present) if use_cache else out
 
 
 class MLP(nn.Module):
@@ -147,10 +160,18 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(cfg.d_model)
         self.mlp = MLP(cfg)
 
-    def forward(self, x, cos, sin, mask=None):
-        x = x + self.attn(self.attn_norm(x), cos, sin, mask)
+    def forward(self, x, cos, sin, mask=None, past_kv=None, use_cache=False,
+                is_causal=None):
+        # 分支写开: 不开缓存时 attn 返回的是张量, 直接 `a, present = ...` 在 B==2 时
+        # 会沿第 0 维解包成功而不报错 —— 一个只在 batch=2 时出现的静默错误。
+        if use_cache:
+            a, present = self.attn(self.attn_norm(x), cos, sin, mask, past_kv, True,
+                                   is_causal)
+        else:
+            a = self.attn(self.attn_norm(x), cos, sin, mask, is_causal=is_causal)
+        x = x + a
         x = x + self.mlp(self.ffn_norm(x))
-        return x
+        return (x, present) if use_cache else x
 
 
 class MiniR1Model(nn.Module):
@@ -182,45 +203,108 @@ class MiniR1Model(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        """idx: (B, T) 长整型 token id。若给 targets 则返回 (loss, logits), 否则只返回 logits。"""
+    def forward(self, idx, targets=None, past_kv=None, use_cache=False):
+        """idx: (B, T) 长整型 token id。若给 targets 则返回 (loss, logits), 否则只返回 logits。
+
+        use_cache=True 时额外返回 present (每层的 (k, v)), 并在最后返回 —— 用来做增量解码:
+        第一次传整条 prompt (past_kv=None), 之后每次只传**1 个新 token** + 上一次的 present。
+        """
         B, T = idx.shape
-        assert T <= self.cfg.max_seq_len, f"序列长度 {T} 超过上限 {self.cfg.max_seq_len}"
+        past_len = past_kv[0][0].shape[2] if past_kv is not None else 0
+        total = past_len + T
+        assert total <= self.cfg.max_seq_len, f"序列长度 {total} 超过上限 {self.cfg.max_seq_len}"
         x = self.tok_emb(idx)
-        cos = self.cos[:T].to(x.dtype)
-        sin = self.sin[:T].to(x.dtype)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        # ★ 位置必须从 past_len 开始数。写成 cos[:T] 是个不报错的错误:
+        #   形状对得上, 只是新 token 拿到了位置 0/1/2... 的旋转角, attention 全乱。
+        cos = self.cos[past_len:total].to(x.dtype)
+        sin = self.sin[past_len:total].to(x.dtype)
+
+        # ★★ 带缓存时**绝不能**给 SDPA 传 is_causal=True。
+        #   PyTorch 的默认因果掩码是**左上角对齐**的 (ones(T, total).tril()), 不是右下角。
+        #   增量解码时 T=1、total=past+1, 于是那个掩码只让唯一的 query 看到**第 0 个 key** ——
+        #   等于把整条历史都屏蔽掉、只拿 prompt 的第一个 token 做 attention。
+        #   不报错、不崩, 只是生成的东西全是垃圾。实测: q_len=1/kv_len=9 时
+        #   可见 key 的下标均值 = 0.000 (全可见应为 4.000)。
+        #   正确做法: T==1 时不需要任何掩码 (历史全在 query 之前);
+        #   T>1 时自己造右下角对齐的掩码 (第 i 行允许到 i+past 列)。
+        if past_len == 0:
+            mask, is_causal = None, True
+        elif T == 1:
+            mask, is_causal = None, False
+        else:
+            mask = torch.ones(T, total, dtype=torch.bool, device=x.device).tril(past_len)
+            is_causal = False
+
+        presents = [] if use_cache else None
+        for i, layer in enumerate(self.layers):
+            pk = past_kv[i] if past_kv is not None else None
+            if use_cache:
+                x, present = layer(x, cos, sin, mask, past_kv=pk, use_cache=True,
+                                   is_causal=is_causal)
+                presents.append(present)
+            else:
+                x = layer(x, cos, sin, mask, is_causal=is_causal)
         x = self.norm(x)
         w = self.tok_emb.weight if self.lm_head is None else self.lm_head.weight
         logits = F.linear(x, w)
-        if targets is None:
-            return logits
-        # reshape 而非 view: F.linear 输出/切片 targets 可能非连续 (CPU/fp32 路径会炸)
-        loss = chunked_cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-        return loss, logits
+        if targets is not None:
+            # reshape 而非 view: F.linear 输出/切片 targets 可能非连续 (CPU/fp32 路径会炸)
+            loss = chunked_cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                         targets.reshape(-1))
+            return (loss, logits, presents) if use_cache else (loss, logits)
+        return (logits, presents) if use_cache else logits
+
+    @staticmethod
+    def _sample(logits, temperature, top_k, top_p):
+        """从 logits 采下一个 token。抽出来是为了让两条生成路径**用同一份采样逻辑** ——
+        复制一份的话, 改了一边忘了另一边, 两条路就会给出不同的分布, 而且很难发现。"""
+        logits = logits / max(temperature, 1e-8)   # temperature≈0 -> 近似贪心
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits = logits.masked_fill(logits < v[:, -1:], -float("inf"))
+        if top_p is not None:
+            srt, srt_idx = torch.sort(logits, descending=True)
+            cum = torch.cumsum(F.softmax(srt, -1), -1)
+            keep = torch.cat([torch.ones_like(cum[:, :1], dtype=torch.bool),
+                              cum[:, :-1] < top_p], -1)
+            logits = logits.scatter(1, srt_idx, torch.where(keep, srt, -float("inf")))
+        # temperature≈0 时 logits 被放得极大, 但 softmax 内部会先减最大值,
+        # 所以不会溢出成 NaN —— 结果就是一个 one-hot (等价于 argmax)。
+        return torch.multinomial(F.softmax(logits, -1), 1)
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None,
-                 eos_id=None):
-        """朴素自回归采样 (评测/演示用, 未做 KV-Cache 优化)。"""
+                 eos_id=None, use_cache=True):
+        """自回归采样 (评测/演示用)。
+
+        use_cache=True (默认): **增量解码** —— prompt 只前向一次, 之后每步只喂 1 个新 token,
+        历史 K/V 从缓存里取。计算量从「每步 O(L²)」降到「每步 O(L)」。
+        use_cache=False: 原来的朴素实现 (每步重算整条序列), 留作对照与兜底。
+        """
+        if idx.size(1) > self.cfg.max_seq_len:
+            idx = idx[:, -self.cfg.max_seq_len:]
+
+        if not use_cache:
+            for _ in range(max_new_tokens):
+                ctx = idx if idx.size(1) <= self.cfg.max_seq_len else idx[:, -self.cfg.max_seq_len:]
+                next_tok = self._sample(self(ctx)[:, -1, :], temperature, top_k, top_p)
+                idx = torch.cat([idx, next_tok], dim=1)
+                if eos_id is not None and (next_tok == eos_id).all():
+                    break
+            return idx
+
+        # 预填充 (prefill): 整条 prompt 走一遍, 顺手把每层的 K/V 留下
+        logits, past = self(idx, use_cache=True)
         for _ in range(max_new_tokens):
-            ctx = idx if idx.size(1) <= self.cfg.max_seq_len else idx[:, -self.cfg.max_seq_len:]
-            logits = self(ctx)[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None:
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, -1:]] = -float("inf")
-            if top_p is not None:
-                srt, srt_idx = torch.sort(logits, descending=True)
-                cum = torch.cumsum(F.softmax(srt, -1), -1)
-                keep = torch.cat([torch.ones_like(cum[:, :1], dtype=torch.bool),
-                                  cum[:, :-1] < top_p], -1)
-                logits = logits.scatter(1, srt_idx, torch.where(keep, srt, -float("inf")))
-            probs = F.softmax(logits, -1)
-            next_tok = torch.multinomial(probs, 1)
+            next_tok = self._sample(logits[:, -1, :], temperature, top_k, top_p)
             idx = torch.cat([idx, next_tok], dim=1)
             if eos_id is not None and (next_tok == eos_id).all():
                 break
+            if idx.size(1) >= self.cfg.max_seq_len:
+                # 缓存只增不减, 到顶就接不下去了。老的非缓存版是滑窗截断 —— 但那样
+                # 位置会重新从 0 数起, 对一条连续序列本来就是错的。这里选择停下。
+                break
+            logits, past = self(next_tok, past_kv=past, use_cache=True)   # 只喂 1 个 token
         return idx
 
     @property
@@ -228,16 +312,30 @@ class MiniR1Model(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-def enable_grad_checkpointing(model: MiniR1Model) -> None:
+def enable_grad_checkpointing(model: MiniR1Model, cache_passthrough: bool = False) -> None:
     """打开逐层激活重算 (显存换时间, 24G 卡上跑大微批次的关键)。
 
     注意: 必须捕获替换前的绑定方法, 否则 checkpoint 重算时会经 __call__ 再次进入
     被替换过的 fwd, 导致无限递归 (RecursionError)。
+
+    cache_passthrough: 同一个模型上**既要带缓存的采样、又要省显存的更新**时才设 True
+    (GRPO 就是这种)。此时 use_cache 的调用直接走原路径、不套检查点 ——
+    采样都在 no_grad 下跑, 存不存激活本来就没区别, 套上去只会白算一遍。
+    预训练/SFT 用不上缓存, 保持默认 False, 这样万一误传 use_cache 会当场报错而不是静默变慢。
     """
     from torch.utils.checkpoint import checkpoint
 
     def make_forward(orig_forward):
-        def fwd(x, cos, sin, mask=None):
+        def fwd(x, cos, sin, mask=None, past_kv=None, use_cache=False, is_causal=None):
+            if use_cache:
+                if not cache_passthrough:
+                    raise RuntimeError(
+                        "梯度检查点与 KV-Cache 不能同时用: 训练不需要缓存, "
+                        "推理请用没打过这个补丁的模型 (评测/GRPO/chat 都没开梯度检查点)")
+                # 增量解码: 原样透传 (no_grad 路径, 检查点没有意义)
+                return orig_forward(x, cos, sin, mask, past_kv, use_cache, is_causal)
+            # 训练永远走「无缓存 + 标准因果掩码」这条路, 保持 checkpoint 调用原样不动。
+            assert is_causal is not False, "训练路径不该出现非因果掩码"
             return checkpoint(orig_forward, x, cos, sin, mask, use_reentrant=False)
         return fwd
 
@@ -252,7 +350,7 @@ def create_model(device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> M
 
 
 if __name__ == "__main__":
-    # 快速自检: 前向 + 反向 + 采样
+    # 快速自检: 前向 + 反向 + 采样 + KV-Cache 等价性
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -265,3 +363,10 @@ if __name__ == "__main__":
     print(f"前向+反向 OK, loss = {loss.item():.4f}, logits 形状 = {tuple(logits.shape)}")
     out = model.generate(x[:1, :8], 8, temperature=1.0, top_k=50)
     print(f"采样 OK, 输出形状 = {tuple(out.shape)}")
+    # 缓存等价性: 预填充的 logits 必须和整条前向的 logits 完全一致
+    prompt = x[:1, :16]
+    lg_full = model(prompt)
+    lg_pf, _ = model(prompt, use_cache=True)
+    diff = (lg_full - lg_pf).abs().max().item()
+    assert diff == 0, f"KV-Cache 预填充与整条前向不一致, 最大差 {diff}"
+    print(f"KV-Cache 预填充等价 OK (最大差 {diff})")

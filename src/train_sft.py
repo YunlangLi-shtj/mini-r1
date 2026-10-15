@@ -22,6 +22,29 @@ from model import MiniR1Model, ModelConfig, enable_grad_checkpointing
 IM_START, IM_END = 4, 5  # <|im_start|> / <|im_end|> (与分词器 SPECIAL_TOKENS 顺序一致)
 
 
+def read_conversations(path):
+    """读本地对话数据的 `conversations` **列** (JSON 数组 或 JSONL), 不经过 datasets。
+
+    ★ 为什么不用 `load_dataset("json", data_files=...)`: 它要在 `~/.cache/huggingface`
+      下落一份 arrow 缓存, 而那是**容器根盘** (多人共享的 overlay, 7TB)。
+      2026-10-14 根盘被占满 (可用 0 字节), datasets 对**没缓存过**的新文件一律
+      `OSError: Not enough disk space` 拒绝处理 —— GSM8K-CoT 热身就是这么一起步就死的:
+      和显存、和代码都无关, 纯粹卡在一个缓存目录上。
+      我们只是要「读一个 json」, json.load 就够, 而且不落任何缓存。
+
+    ★ 返回值必须和原来的 `ds["conversations"]` 逐字一致: 那取的是**列** (list[list[turn]])。
+      顺手返回 list[row_dict] 的话, 下游 build_example 迭代一行会拿到 dict 的键,
+      报 "TypeError: string indices must be integers" —— 2026-10-14 就是这么又栽了一次。
+    """
+    with open(path, encoding="utf-8") as f:
+        if f.read(1) == "[":
+            f.seek(0)
+            rows = json.load(f)
+        else:
+            rows = [json.loads(line) for line in f if line.strip()]
+    return [r["conversations"] for r in rows]
+
+
 def format_chatml(convs):
     """OpenHermes 的 conversations -> ChatML 文本。"""
     parts = []
@@ -116,13 +139,12 @@ def main():
 
     # ---- 数据: OpenHermes-2.5, 过滤过长样本 ----
     if args.data_file:
-        ds = load_dataset("json", data_files=args.data_file, split="train")
+        convs = read_conversations(args.data_file)    # 本地文件直接读, 见函数注释
     else:
-        ds = load_dataset("teknium/OpenHermes-2.5", split="train")
-    ds = ds.select(range(min(args.max_samples, len(ds))))
+        convs = load_dataset("teknium/OpenHermes-2.5", split="train")["conversations"]
+    convs = convs[:min(args.max_samples, len(convs))]
     # 逐条分词 (tokenizers 是 Rust 实现, 20 万条只需 ~1 分钟)。
     # 不用 datasets.map: 它会把 ragged 的 list-of-lists 展平成多行。
-    convs = ds["conversations"]
     examples = [e for e in (build_example(c, tok, args.max_len) for c in convs) if e is not None]
     dropped = len(convs) - len(examples)
     print(f"SFT 样本数: {len(examples):,} (丢弃全掩码样本 {dropped})")
